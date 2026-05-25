@@ -48,3 +48,7 @@ error_log_videorag.txt
 failed_payloads.txt
 scratch/
 run_ingest_tm.py
+# --- Extra Data & Reports ---
+*.pdf
+*ablation*.json
+push_hf.py

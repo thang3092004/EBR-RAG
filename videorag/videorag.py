@@ -32,7 +32,6 @@ from ._storage import (
     NanoVectorDBStorage,
     NanoVectorDBVideoSegmentStorage,
     NetworkXStorage,
-    TVGStorage,
 )
 from ._utils import (
     EmbeddingFunc,
@@ -115,7 +114,6 @@ class VideoRAG:
     vector_db_storage_cls_kwargs: dict = field(default_factory=dict)
     graph_storage_cls: Type[BaseGraphStorage] = NetworkXStorage
     enable_llm_cache: bool = True
-    enable_tvg: bool = False  # Set to False to disable TVG ingest/loading
     use_tm_graph: bool = False # Ablation flag for TM Graph RAG
 
     # extension
@@ -202,21 +200,6 @@ class VideoRAG:
             )
         )
 
-        # --- TVG Storage (optional, guarded by enable_tvg) ---
-        self.tvg_storage: Optional[TVGStorage] = None
-        if self.enable_tvg:
-            try:
-                self.tvg_storage = TVGStorage(
-                    namespace="tvg",
-                    global_config=asdict(self),
-                )
-            except Exception as _tvg_init_err:
-                logger.warning(
-                    f"[VideoRAG] TVGStorage init failed (non-fatal): {_tvg_init_err}. "
-                    "TVG will be disabled for this session."
-                )
-                self.tvg_storage = None
-        
         self.llm.best_model_func = limit_async_func_call(self.llm.best_model_max_async)(
             partial(self.llm.best_model_func, hashing_kv=self.llm_response_cache)
         )
@@ -479,9 +462,6 @@ class VideoRAG:
             # ---------- commit upsertings and indexing
             await self.text_chunks.upsert(inserting_chunks)
 
-            # ---------- TVG build (incremental; skipped if enable_tvg=False)
-            if self.tvg_storage is not None:
-                await self._build_tvg()
         finally:
             await self._insert_done()
 
@@ -494,33 +474,6 @@ class VideoRAG:
                 continue
             tasks.append(cast(StorageNameSpace, storage_inst).index_start_callback())
         await asyncio.gather(*tasks)
-
-    async def _build_tvg(self) -> None:
-        """Incrementally build or update the TVG after entity extraction.
-
-        Called automatically at the end of :meth:`ainsert`. Requires that
-        ``self.tvg_storage`` is not ``None``.
-
-        The method is non-blocking for the standard VideoRAG modes: if TVG
-        construction fails for any reason, a warning is logged and the error
-        is swallowed so that the main ingest pipeline continues.
-        """
-        if self.tvg_storage is None:
-            return
-        try:
-            logger.info("[VideoRAG] Building TVG…")
-            await self.tvg_storage.build(
-                video_segments_data=self.video_segments._data,
-                existing_entity_graph=self.chunk_entity_relation_graph._graph,
-                text_chunks_data=self.text_chunks._data,
-                video_segment_feature_vdb=self.video_segment_feature_vdb,
-                text_embedding_func=self.embedding_func,
-            )
-            logger.info("[VideoRAG] TVG build complete.")
-        except Exception as e:
-            logger.error(f"[VideoRAG] TVG build failed: {e}")
-            # User requirement: Do not fallback or swallow exceptions
-            raise RuntimeError(f"TVG Construction failed: {e}") from e
 
     async def _save_video_segments(self):
         tasks = []
@@ -545,7 +498,6 @@ class VideoRAG:
             self.video_segment_feature_vdb,
             self.video_segments,
             self.video_path_db,
-            self.tvg_storage,       # persist TVG after each ingest
         ]:
             if storage_inst is None:
                 continue

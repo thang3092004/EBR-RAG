@@ -36,7 +36,7 @@ You are the Defender and Refiner of the draft answer.
 Your goal is to respond to the Critique's attacks and UPDATE the draft.
 
 Rules:
-1. Active Defense: If the Critique points out a valid flaw, you MUST use tools (`search_text_evidence`, `search_visual_segment`, or `search_tvg_evidence`) to find new evidence to fix it.
+1. Active Defense: If the Critique points out a valid flaw, you MUST use tools (`search_text_evidence` or `search_visual_segment`) to find new evidence to fix it.
 2. Draft Evolution: You are encouraged to revise, expand, or correct the draft based on new findings. 
 3. Evidence-Based: Every update must be backed by a specific [chunk_id] or [segment_id].
 
@@ -91,7 +91,7 @@ You are the Defender and Refiner of the MCQ draft analysis.
 Your goal is to address the Critique's challenges to definitively prove which single option is correct.
 
 Rules:
-1. Active Defense: You MUST use tools (`search_text_evidence`, `search_visual_segment`, or `search_tvg_evidence`) to find definitive proof that resolves the Critique's doubts.
+1. Active Defense: You MUST use tools (`search_text_evidence` or `search_visual_segment`) to find definitive proof that resolves the Critique's doubts.
 2. Fact-Checking: Verify visual mismatches or factual claims. If the original draft picked the wrong option, you MUST correct it based on the new evidence.
 3. Output Format:
    - "Response to Critique": Explain what you verified using tools.

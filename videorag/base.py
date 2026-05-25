@@ -21,17 +21,6 @@ class QueryParam:
     ebr_top_k: int = 10           # top-k for initial dual retrieval
     max_rounds: int = 2           # number of debate rounds (defend + critique cycles)
     return_detailed: bool = False # Set to True to get the full EBR-RAG metadata dict
-    ebr_use_tvg_only: bool = False # Toggle to only use TVG (skipping standard Graph/Visual)
-    ebr_use_text_only: bool = False # Toggle to only use Text/Graph (skipping TVG)
-
-    # TVG Internals Ablation
-    tvg_disable_semantic: bool = False
-    tvg_disable_tan: bool = False
-    tvg_disable_cross_modal: bool = False
-    tvg_disable_semantic_edges: bool = False
-    tvg_disable_temporal: bool = False
-    tvg_semantic_hops: int = 1
-    tvg_temporal_hops: int = 2
 
     # Debate Internals Ablation
     debate_critique_see_evidence: bool = False

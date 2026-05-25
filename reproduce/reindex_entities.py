@@ -72,46 +72,7 @@ async def reindex_entities(col_id, sub_category):
     await vrag.chunk_entity_relation_graph.index_done_callback()
     await entities_storage.index_done_callback()
     
-    # --- Re-build TVG ---
-    print(f"--- [3/3] Re-building TVG for {sub_category} ---")
-    from videorag.tvg.builder import build_tvg
-    from videorag.tvg.graph import TVGraph
-    import networkx as nx
-    
-    # Load segment data
-    segments_path = work_dir / "kv_store_video_segments.json"
-    with open(segments_path, "r", encoding="utf-8") as f:
-        video_segments_data = json.load(f)
-        
-    # Initialize Video Segment Feature VDB
-    from videorag._storage.vdb_nanovectordb import NanoVectorDBVideoSegmentStorage
-    video_vdb = NanoVectorDBVideoSegmentStorage(
-        namespace="video_segment_feature",
-        global_config=asdict(vrag),
-        embedding_func=None
-    )
-    
-    # Create a fresh TVGraph instance as required by the signature
-    # Use dimensions from the config
-    tan_dim = asdict(vrag).get("video_embedding_dim", 1024)
-    semantic_dim = vrag.llm.embedding_dim
-    
-    current_tvg = TVGraph(tan_dim=tan_dim, semantic_dim=semantic_dim)
-    
-    # Re-build TVG mirroring self._build_tvg()
-    new_tvg = await build_tvg(
-        video_segments_data=video_segments_data,
-        existing_entity_graph=vrag.chunk_entity_relation_graph._graph, 
-        text_chunks_data=chunks_data,
-        video_segment_feature_vdb=video_vdb,
-        text_embedding_func=vrag.embedding_func,
-        tvg=current_tvg, # Passed as required argument
-        working_dir=str(work_dir),
-        semantic_dim=semantic_dim
-    )
-    
-    # Save TVG
-    new_tvg.save(str(work_dir / "tvg"))
+
     
     print(f"✅ SUCCESSFULLY restored {sub_category}")
 
