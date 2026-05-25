@@ -120,7 +120,7 @@ async def main():
 
     # Configuration for comparison
     processed_ids = ['0', '13', '17']
-    evaluation_answer_dirs = ['answers-EBR-RAG-baseline', 'answers-EBR-RAG-tvg-only']
+    evaluation_answer_dirs = ['answers-EBR-RAG-baseline']
     baseline_dir_name = 'answers-naiverag'
     
     evaluation_pairs = []
