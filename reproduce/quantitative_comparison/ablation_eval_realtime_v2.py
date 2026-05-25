@@ -127,7 +127,7 @@ async def main():
         questions_dataset = json.load(f)
 
     # Collections to evaluate
-    collection_ids = ['6', '11', '19']
+    collection_ids = ['19']
     
     # Ablation scenarios
     ablation_scenarios = [
@@ -140,6 +140,7 @@ async def main():
         'no_debate',
         'critique_with_evidence',
         'defender_no_tools',
+        'baseline_with_debate',
     ]
     
     baseline_dir = 'answers-naiverag'
@@ -207,7 +208,8 @@ async def main():
     tasks = [call_judge(client, sem, pair) for pair in evaluation_pairs]
     results = []
     
-    async for result in tqdm.tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+        result = await coro
         results.append(result)
 
     # Save results

@@ -5,6 +5,9 @@ import tqdm
 import numpy as np
 from openai import AsyncOpenAI
 import argparse
+from dotenv import load_dotenv
+
+from pathlib import Path
 
 # ===========================================================================
 # EBR-RAG Full Ablation & Framework Real-time Evaluation Script
@@ -109,6 +112,10 @@ async def call_judge(client, sem, request_data):
     return {"custom_id": request_data["custom_id"], "error": "Max retries reached"}
 
 async def main():
+    # Load .env from project root
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    load_dotenv(repo_root / ".env")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--output", type=str, default="ablation_realtime_results.json")
@@ -134,8 +141,9 @@ async def main():
     client = AsyncOpenAI()
     sem = asyncio.Semaphore(args.concurrency)
     
-    dataset_path = "../../longervideos/dataset.json"
-    if not os.path.exists(dataset_path):
+    # Dataset path relative to project root
+    dataset_path = repo_root / "longervideos/dataset.json"
+    if not dataset_path.exists():
         print(f"Error: Dataset not found at {dataset_path}")
         return
 
@@ -157,23 +165,24 @@ async def main():
         
         collection_desc = meta_list[0]['description']
         questions = meta_list[0]['questions']
-        base_dir = f"../all_answers/{_id}-{collection_desc}"
+        # Path relative to project root
+        base_dir = repo_root / "reproduce/all_answers" / f"{_id}-{collection_desc}"
         
         for q in questions:
             q_id = q['id']
             query_text = q['question']
             
-            baseline_path = os.path.join(base_dir, baseline_answer_dir, f"answer_{q_id}.md")
-            if not os.path.exists(baseline_path):
+            baseline_path = base_dir / baseline_answer_dir / f"answer_{q_id}.md"
+            if not baseline_path.exists():
                 continue
             
             with open(baseline_path, 'r', encoding='utf-8') as fb:
                 base_ans = fb.read()
 
             for eval_dir in evaluation_answer_dirs:
-                target_path = os.path.join(base_dir, eval_dir, f"answer_{q_id}.md")
+                target_path = base_dir / eval_dir / f"answer_{q_id}.md"
                 
-                if os.path.exists(target_path):
+                if target_path.exists():
                     with open(target_path, 'r', encoding='utf-8') as f1:
                         target_ans = f1.read()
                         
@@ -244,6 +253,7 @@ async def main():
     # Map dir names to friendly names
     name_map = {
         "full_framework": "Full Framework",
+        "baseline_with_debate": "Baseline with Debate",
         "no_semantic_nodes": "w/o Semantic Nodes",
         "no_tan_nodes": "w/o TAN Nodes",
         "no_semantic_edges": "w/o Semantic Edges",
@@ -285,7 +295,4 @@ async def main():
     print(f"\nSummary saved to ablation_summary.json")
 
 if __name__ == "__main__":
-    if not os.environ.get("OPENAI_API_KEY"):
-        print("Error: Please set OPENAI_API_KEY environment variable.")
-    else:
-        asyncio.run(main())
+    asyncio.run(main())
