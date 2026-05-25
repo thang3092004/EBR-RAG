@@ -1,74 +1,42 @@
 {
     "full_framework": {
-        "Comprehensiveness": 4.815789473684211,
-        "Empowerment": 4.815789473684211,
-        "Trustworthiness": 4.828947368421052,
-        "Depth": 4.7894736842105265,
-        "Density": 4.815789473684211,
-        "Overall Score": 4.815789473684211
+        "Comprehensiveness": 5.0,
+        "Empowerment": 5.0,
+        "Trustworthiness": 5.0,
+        "Depth": 5.0,
+        "Density": 5.0,
+        "Overall Score": 5.0
     },
-    "no_semantic_nodes": {
-        "Comprehensiveness": 4.723684210526316,
-        "Empowerment": 4.7368421052631575,
-        "Trustworthiness": 4.7631578947368425,
-        "Depth": 4.657894736842105,
-        "Density": 4.75,
-        "Overall Score": 4.723684210526316
-    },
-    "no_tan_nodes": {
-        "Comprehensiveness": 4.855263157894737,
-        "Empowerment": 4.855263157894737,
-        "Trustworthiness": 4.855263157894737,
-        "Depth": 4.828947368421052,
-        "Density": 4.855263157894737,
-        "Overall Score": 4.855263157894737
-    },
-    "no_semantic_edges": {
-        "Comprehensiveness": 4.776315789473684,
-        "Empowerment": 4.7894736842105265,
-        "Trustworthiness": 4.776315789473684,
-        "Depth": 4.7368421052631575,
-        "Density": 4.7894736842105265,
-        "Overall Score": 4.776315789473684
-    },
-    "no_temporal_edges": {
-        "Comprehensiveness": 4.7894736842105265,
-        "Empowerment": 4.7894736842105265,
-        "Trustworthiness": 4.7894736842105265,
-        "Depth": 4.75,
-        "Density": 4.815789473684211,
-        "Overall Score": 4.7894736842105265
-    },
-    "no_cross_modal_edges": {
-        "Comprehensiveness": 4.7894736842105265,
-        "Empowerment": 4.802631578947368,
-        "Trustworthiness": 4.802631578947368,
-        "Depth": 4.75,
-        "Density": 4.815789473684211,
-        "Overall Score": 4.7894736842105265
+    "baseline_with_debate": {
+        "Comprehensiveness": 4.852941176470588,
+        "Empowerment": 4.852941176470588,
+        "Trustworthiness": 4.852941176470588,
+        "Depth": 4.882352941176471,
+        "Density": 4.852941176470588,
+        "Overall Score": 4.852941176470588
     },
     "no_debate": {
-        "Comprehensiveness": 4.828947368421052,
-        "Empowerment": 4.855263157894737,
-        "Trustworthiness": 4.828947368421052,
-        "Depth": 4.802631578947368,
-        "Density": 4.868421052631579,
-        "Overall Score": 4.828947368421052
+        "Comprehensiveness": 4.882352941176471,
+        "Empowerment": 4.882352941176471,
+        "Trustworthiness": 4.882352941176471,
+        "Depth": 4.852941176470588,
+        "Density": 4.882352941176471,
+        "Overall Score": 4.882352941176471
     },
     "critique_with_evidence": {
-        "Comprehensiveness": 4.815789473684211,
-        "Empowerment": 4.815789473684211,
-        "Trustworthiness": 4.815789473684211,
-        "Depth": 4.776315789473684,
-        "Density": 4.828947368421052,
-        "Overall Score": 4.815789473684211
+        "Comprehensiveness": 4.970588235294118,
+        "Empowerment": 4.970588235294118,
+        "Trustworthiness": 4.970588235294118,
+        "Depth": 4.970588235294118,
+        "Density": 4.970588235294118,
+        "Overall Score": 4.970588235294118
     },
     "defender_no_tools": {
-        "Comprehensiveness": 4.776315789473684,
-        "Empowerment": 4.7894736842105265,
-        "Trustworthiness": 4.7894736842105265,
-        "Depth": 4.7631578947368425,
-        "Density": 4.776315789473684,
-        "Overall Score": 4.776315789473684
+        "Comprehensiveness": 5.0,
+        "Empowerment": 5.0,
+        "Trustworthiness": 5.0,
+        "Depth": 5.0,
+        "Density": 5.0,
+        "Overall Score": 5.0
     }
 }
