@@ -1,6 +1,7 @@
 import os
 # Optional hardcoded key (user requested). Leave empty to use environment variable.
-OPENAI_API_KEY = "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"
+import os
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 if OPENAI_API_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 import time
