@@ -9,7 +9,6 @@ Improvements over previous version:
 - reads max_rounds and ebr_top_k from QueryParam
 - dispatch_tool passes global_config + query_param for LLM query rewriting
 - returns richer output: confidence, rounds_run, tool_calls_made
-- (NEW) incorporates TVG evidence when tvg_storage is available on vrag
 """
 import asyncio
 import os

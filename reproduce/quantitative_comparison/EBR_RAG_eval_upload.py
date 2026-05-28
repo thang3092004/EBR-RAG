@@ -135,8 +135,7 @@ if __name__ == "__main__":
     base_dir = 'EBR_RAG_comparison'
     evaluation_answer_dirs = [
         'answers-videorag',             # Original VideoRAG
-        'answers-EBR-RAG-baseline',   # EBR-RAG without TVG
-        'answers-EBR-RAG-tvg-only',   # EBR-RAG with TVG
+        'answers-EBR-RAG-baseline',     # EBR-RAG
     ]
 
     requests = []
