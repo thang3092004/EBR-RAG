@@ -21,30 +21,23 @@ global_azure_openai_async_client = None
 global_ollama_client = None
 
 def get_openai_async_client_instance():
-    global global_openai_async_client
-    if global_openai_async_client is None:
-        global_openai_async_client = AsyncOpenAI(
-            api_key=os.environ.get("OPENAI_API_KEY"),
-            base_url=os.environ.get("OPENAI_BASE_URL")
-        )
-    return global_openai_async_client
+    # Do not cache globally because different threads use different asyncio event loops,
+    # which causes httpx to hang or crash when reusing connection pools.
+    return AsyncOpenAI(
+        api_key=os.environ.get("OPENAI_API_KEY"),
+        base_url=os.environ.get("OPENAI_BASE_URL")
+    )
 
 
 def get_azure_openai_async_client_instance():
-    global global_azure_openai_async_client
-    if global_azure_openai_async_client is None:
-        global_azure_openai_async_client = AsyncAzureOpenAI(
-            api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-            azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT")
-        )
-    return global_azure_openai_async_client
+    return AsyncAzureOpenAI(
+        api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
+        azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT")
+    )
 
 def get_ollama_async_client_instance():
-    global global_ollama_client
-    if global_ollama_client is None:
-        # set OLLAMA_HOST or pass in host="http://127.0.0.1:11434"
-        global_ollama_client = AsyncClient()  # Adjust base URL if necessary        
-    return global_ollama_client
+    # set OLLAMA_HOST or pass in host="http://127.0.0.1:11434"
+    return AsyncClient()
 
 # Setup LLM Configuration.
 @dataclass
