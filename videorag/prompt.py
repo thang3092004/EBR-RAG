@@ -134,7 +134,18 @@ PROMPTS[
 ] = """It appears some entities may have still been missed.  Answer YES | NO if there are still entities that need to be added.
 """
 
-PROMPTS["DEFAULT_ENTITY_TYPES"] = ["organization", "person", "geo", "event"]
+PROMPTS["DEFAULT_ENTITY_TYPES"] = [
+    "organization",
+    "person",
+    "object",
+    "animal",
+    "screen_element",
+    "speaker",
+    "geo",
+    "location",
+    "event",
+    "concept",
+]
 PROMPTS["DEFAULT_TUPLE_DELIMITER"] = "<|>"
 PROMPTS["DEFAULT_RECORD_DELIMITER"] = "##"
 PROMPTS["DEFAULT_COMPLETION_DELIMITER"] = "<|COMPLETE|>"
@@ -439,23 +450,27 @@ Please provide your answer in JSON format as follows:
 Key points:
 1. Ensure that the "Answer" reflects the correct label format.
 2. Structure the "Explanation" for clarity, using Markdown for any necessary formatting.
-"""# This is an add-on to PROMPTS in prompt.py for TM Graph RAG
+"""
+# This is an add-on to PROMPTS in prompt.py for TM Graph RAG
 # Prompt for TM-GraphRAG (Temporal Memory GraphRAG)
 
 TM_PROMPT_ADDITIONS = {
     "entity_extraction": """-Goal-
 Given a text document that is potentially relevant to this activity, a list of entity types, and a "Short-Term Memory" of recently extracted entities and relationships from the preceding parts of this video/document, identify all entities and relationships from the text.
-You MUST prioritize linking back to the exact entities listed in the Short-Term Memory if you encounter them again in the text.
+The text may contain an "Entity Memory" section with grounded IDs such as PERSON_001, OBJECT_003, ANIMAL_002, SCREEN_001, or SPEAKER_001. These IDs come from visual/audio tracking and are more reliable than free-form names.
+You MUST prioritize exact grounded IDs from Entity Memory and exact entities listed in Short-Term Memory when you encounter them again in the text.
 
 -Steps-
-1. Review the Short-Term Memory list provided below. This represents the immediate context leading up to this segment.
+1. Review the Entity Memory in the text and the Short-Term Memory list provided below. Entity Memory represents grounded video entities; Short-Term Memory represents recently extracted graph entities.
 2. Identify all entities. For each identified entity, extract the following information:
-- entity_name: Name of the entity, capitalized
+- entity_name: Name of the entity, capitalized. If a grounded ID is available, use the exact ID as entity_name, e.g. PERSON_001 or OBJECT_014.
 - entity_type: One of the following types: [{entity_types}]
 - entity_description: Comprehensive description of the entity's attributes and activities
 Format each entity as ("entity" {tuple_delimiter} <entity_name> {tuple_delimiter} <entity_type> {tuple_delimiter} <entity_description>)
 
-3. Identify all relationships between entities. For each related pair, extract the following information:
+3. Do not create entity nodes whose name is only a pronoun or vague class label such as HE, SHE, IT, THEY, MAN, WOMAN, PERSON, OBJECT when a grounded ID is present. Put aliases and natural descriptions inside entity_description instead.
+
+4. Identify all relationships between entities. For each related pair, extract the following information:
 - source_entity: name of the source entity, as identified in step 2
 - target_entity: name of the target entity, as identified in step 2
 - relationship_description: explanation as to why you think the source entity and the target entity are related to each other
@@ -463,9 +478,9 @@ Format each entity as ("entity" {tuple_delimiter} <entity_name> {tuple_delimiter
 - relationship_keywords: one or more high-level key words that summarize the overarching nature of the relationship, focusing on concepts or themes rather than specific details
 Format each relationship as ("relationship" {tuple_delimiter} <source_entity> {tuple_delimiter} <target_entity> {tuple_delimiter} <relationship_description> {tuple_delimiter} <relationship_keywords> {tuple_delimiter} <relationship_strength>)
 
-4. Return output in English as a single list of all the entities and relationships identified in steps 1 and 2. Use **{record_delimiter}** as the list delimiter.
+5. Return output in English as a single list of all the entities and relationships identified in steps 1 and 2. Use **{record_delimiter}** as the list delimiter.
 
-5. When finished, output {completion_delimiter}
+6. When finished, output {completion_delimiter}
 
 ######################
 -Examples-

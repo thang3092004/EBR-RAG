@@ -12,7 +12,7 @@ from tenacity import (
 )
 import os
 
-from ._utils import compute_args_hash, wrap_embedding_func_with_attrs
+from ._utils import compute_args_hash, log_openai_usage, wrap_embedding_func_with_attrs
 from .base import BaseKVStorage
 from ._utils import EmbeddingFunc
 
@@ -110,6 +110,7 @@ async def openai_complete_if_cache(
     response = await openai_async_client.chat.completions.create(
         model=model, messages=messages, **kwargs
     )
+    log_openai_usage(model, "chat.completions", response.usage)
 
     if hashing_kv is not None and use_cache:
         await hashing_kv.upsert(
@@ -150,6 +151,12 @@ async def openai_embedding(model_name: str, texts: list[str]) -> np.ndarray:
     openai_async_client = get_openai_async_client_instance()
     response = await openai_async_client.embeddings.create(
         model=model_name, input=texts, encoding_format="float"
+    )
+    log_openai_usage(
+        model_name,
+        "embeddings",
+        response.usage,
+        {"batch_size": len(texts)},
     )
     return np.array([dp.embedding for dp in response.data])
 

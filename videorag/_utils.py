@@ -102,6 +102,41 @@ def load_json(file_name):
         return json.load(f)
 
 
+def _usage_to_dict(usage: Any) -> dict:
+    if usage is None:
+        return {}
+    if isinstance(usage, dict):
+        return usage
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump()
+    if hasattr(usage, "dict"):
+        return usage.dict()
+    try:
+        return vars(usage)
+    except TypeError:
+        return {}
+
+
+def log_openai_usage(model: str, endpoint: str, usage: Any, extra: dict | None = None):
+    usage_log = os.environ.get("OPENAI_USAGE_LOG")
+    if not usage_log or usage is None:
+        return
+
+    record = {
+        "model": model,
+        "endpoint": endpoint,
+        "usage": _usage_to_dict(usage),
+    }
+    if extra:
+        record.update(extra)
+
+    log_dir = os.path.dirname(os.path.abspath(usage_log))
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    with open(usage_log, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 # it's dirty to type, so it's a good way to have fun
 def pack_user_ass_to_openai_messages(*args: str):
     roles = ["user", "assistant"]

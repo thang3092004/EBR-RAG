@@ -1049,7 +1049,8 @@ async def extract_entities_tm(
                 )
         return chunk_nodes, chunk_edges
 
-    for i in range(0, len(ordered_chunks), batch_size):
+    from tqdm import tqdm
+    for i in tqdm(range(0, len(ordered_chunks), batch_size), desc="[EBR-RAG] Extracting TM Graph Entities & Relations"):
         batch_chunks = ordered_chunks[i:i+batch_size]
         current_time += 1
         

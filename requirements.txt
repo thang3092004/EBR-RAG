@@ -21,6 +21,7 @@ iopath
 matplotlib
 types-regex
 transformers==4.37.1
+ultralytics
 
 # Video & Audio Processing
 moviepy==1.0.3

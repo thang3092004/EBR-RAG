@@ -1,9 +1,22 @@
 import os
 import sys
+from importlib.machinery import ModuleSpec
+from unittest.mock import MagicMock
+
+# Setup robust flash_attn mock to prevent importlib.util.find_spec errors
+flash_attn_spec = ModuleSpec("flash_attn", None)
+flash_attn_mock = MagicMock()
+flash_attn_mock.__spec__ = flash_attn_spec
+flash_attn_mock.__path__ = []
+sys.modules["flash_attn"] = flash_attn_mock
+sys.modules["flash_attn.flash_attn_interface"] = MagicMock()
+sys.modules["flash_attn.bert_padding"] = MagicMock()
+
 import json
 import shutil
 import asyncio
 import multiprocessing
+import numpy as np
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from functools import partial
@@ -11,6 +24,7 @@ from typing import Callable, Dict, List, Optional, Type, Union, cast
 from transformers import AutoModel, AutoTokenizer
 import torch
 import tiktoken
+from tqdm import tqdm
 
 
 from ._llm import (
@@ -74,6 +88,21 @@ class VideoRAG:
     video_embedding_batch_num: int = 2
     segment_retrieval_top_k: int = 8 # Ablation: Tweak baseline to 8 (slightly larger/equal to EBR-RAG max cap)
     video_embedding_dim: int = 1024
+
+    # entity anchoring
+    enable_entity_anchoring: bool = False
+    entity_tracking_model: str = "yolov8n.pt"
+    entity_tracking_tracker: str = "botsort.yaml"
+    entity_tracking_fps: float = 3.0
+    entity_tracking_vid_stride: int = 0
+    entity_tracking_conf: float = 0.25
+    entity_tracking_iou: float = 0.5
+    entity_tracking_imgsz: int = 640
+    entity_linking_similarity_threshold: float = 0.82
+    entity_linking_max_time_gap: float = 3.0
+    entity_memory_top_k: int = 12
+    entity_anchor_storage_dir: str = "entity_anchor"
+    entity_anchor_strict: bool = False
     
     # query
     retrieval_topk_chunks: int = 8 # Ablation: Tweak baseline to 8
@@ -127,7 +156,7 @@ class VideoRAG:
             model_path = os.path.abspath("./MiniCPM-V-2_6-int4")
             if not os.path.exists(model_path):
                 model_path = "openbmb/MiniCPM-V-2_6-int4"
-            self.caption_model = AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="cuda")
+            self.caption_model = AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="cuda", attn_implementation="sdpa")
             self.caption_tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
             self.caption_model.eval()
         else:
@@ -211,9 +240,59 @@ class VideoRAG:
             from ._op import extract_entities_tm
             self.entity_extraction_func = extract_entities_tm
 
+    def _reconstruct_segment_metadata(self, existing_data: dict):
+        segment_index2name, segment_times_info = {}, {}
+        for index, segment_data in existing_data.items():
+            time_text = segment_data.get("time", "0-0")
+            try:
+                start_text, end_text = time_text.split("-", 1)
+                start, end = float(start_text), float(end_text)
+            except Exception:
+                start, end = 0.0, float(self.video_segment_length)
+
+            frame_times = segment_data.get("frame_times")
+            if frame_times is None:
+                frame_times = np.linspace(start, end, self.rough_num_frames_per_segment, endpoint=False)
+            else:
+                frame_times = np.asarray(frame_times, dtype=float)
+
+            segment_index = str(index)
+            segment_index2name[segment_index] = f"stable-{segment_index}-{start:g}-{end:g}"
+            segment_times_info[segment_index] = {
+                "frame_times": frame_times,
+                "timestamp": (start, end),
+            }
+        return segment_index2name, segment_times_info
+
+    def _build_entity_memory_for_video(self, video_name, video_path, segment_times_info, existing_data):
+        if not self.enable_entity_anchoring:
+            return {
+                str(index): data.get("entity_memory", "")
+                for index, data in existing_data.items()
+            } if existing_data else {}
+
+        try:
+            from ._entity_anchor import build_entity_anchor
+
+            result = build_entity_anchor(
+                video_name=video_name,
+                video_path=video_path,
+                segment_times_info=segment_times_info,
+                global_config=asdict(self),
+            )
+            return result.segment_memory
+        except Exception as exc:
+            if self.entity_anchor_strict:
+                raise
+            logger.warning(f"Entity anchoring failed for {video_name}: {exc}. Continuing without entity memory.")
+            return {
+                str(index): data.get("entity_memory", "")
+                for index, data in existing_data.items()
+            } if existing_data else {}
+
     def insert_video(self, video_path_list=None):
         loop = always_get_an_event_loop()
-        for video_path in video_path_list:
+        for video_path in tqdm(video_path_list, desc="Ingesting videos", unit="video"):
             # Step0: check the existence
             video_name = os.path.basename(video_path).split('.')[0]
             existing_data = self.video_segments._data.get(video_name, {})
@@ -222,6 +301,8 @@ class VideoRAG:
             all_done = False
             if existing_data:
                 all_done = all(v.get("content") is not None and "Caption:\nNone" not in v.get("content") for v in existing_data.values())
+                if self.enable_entity_anchoring:
+                    all_done = all_done and all("entity_memory" in v for v in existing_data.values())
             
             if all_done:
                 logger.info(f"Find the fully processed video named {os.path.basename(video_path)} in storage and skip it.")
@@ -244,9 +325,8 @@ class VideoRAG:
             # We still need segment_index2name and segment_times_info for subsequent steps
             # if we are skipping, we reconstruct them from existing_data
             if has_features and existing_data:
-                logger.info(f"Find visual features for {video_name} in storage. Skipping Step 1-6.")
-                segment_index2name = {index: f"dummy_{index}" for index in existing_data.keys()}
-                segment_times_info = {index: v.get("time") for index, v in existing_data.items()}
+                logger.info(f"Find visual features for {video_name} in storage. Reconstructing segment metadata.")
+                segment_index2name, segment_times_info = self._reconstruct_segment_metadata(existing_data)
             else:
                 segment_index2name, segment_times_info = split_video(
                     video_path, 
@@ -256,6 +336,12 @@ class VideoRAG:
                     self.audio_output_format,
                 )
 
+            segment_entity_memory = self._build_entity_memory_for_video(
+                video_name,
+                video_path,
+                segment_times_info,
+                existing_data,
+            )
             
             # Step2: obtain transcript with whisper (skip if already exists in existing_data)
             has_transcripts = existing_data and all(v.get("transcript") is not None for v in existing_data.values())
@@ -272,6 +358,7 @@ class VideoRAG:
                     segment_times_info,
                     transcripts,
                     {index: "None" for index in segment_index2name}, # Temporary NO caption
+                    segment_entity_memory,
                 )
                 loop.run_until_complete(self.video_segments.upsert({video_name: partial_segments}))
                 loop.run_until_complete(self._save_video_segments())
@@ -285,6 +372,8 @@ class VideoRAG:
             error_queue = manager.Queue()
             
             has_captions = existing_data and all(v.get("content") is not None and "Caption:\nNone" not in v.get("content") for v in existing_data.values())
+            if self.enable_entity_anchoring and existing_data:
+                has_captions = has_captions and all("entity_memory" in v for v in existing_data.values())
             
             if not has_captions:
                 process_saving_video_segments = multiprocessing.Process(
@@ -310,6 +399,8 @@ class VideoRAG:
                         segment_times_info,
                         captions,
                         error_queue,
+                        segment_entity_memory,
+                        self.working_dir,
                     )
                 )
                 
@@ -350,6 +441,7 @@ class VideoRAG:
                 segment_times_info,
                 transcripts,
                 captions,
+                segment_entity_memory,
             )
             manager.shutdown()
             loop.run_until_complete(self.video_segments.upsert(
