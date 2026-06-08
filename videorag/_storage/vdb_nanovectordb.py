@@ -6,11 +6,9 @@ from typing import Optional
 import numpy as np
 from nano_vectordb import NanoVectorDB
 from tqdm import tqdm
-from imagebind.models import imagebind_model
 
 from .._utils import logger
 from ..base import BaseVectorStorage
-from .._videoutil import encode_video_segments, encode_string_query
 
 
 @dataclass
@@ -65,7 +63,8 @@ class NanoVectorDBStorage(BaseVectorStorage):
             better_than_threshold=self.cosine_better_than_threshold,
         )
         results = [
-            {**dp, "id": dp["__id__"], "distance": dp["__metrics__"]} for dp in results
+            {**dp, "id": dp["__id__"], "similarity": float(dp["__metrics__"])}
+            for dp in results
         ]
         return results
 
@@ -92,6 +91,10 @@ class NanoVectorDBVideoSegmentStorage(BaseVectorStorage):
         )
     
     async def upsert(self, video_name, segment_index2name, video_output_format):
+        from imagebind.models import imagebind_model
+
+        from .._videoutil.feature import encode_video_segments
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         embedder = imagebind_model.imagebind_huge(pretrained=True).to(device)
         embedder.eval()
@@ -125,9 +128,16 @@ class NanoVectorDBVideoSegmentStorage(BaseVectorStorage):
         for i, d in enumerate(list_data):
             d["__vector__"] = embeddings[i]
         results = self._client.upsert(datas=list_data)
+        del embedder
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return results
     
     async def query(self, query: str, top_k: Optional[int] = None):
+        from imagebind.models import imagebind_model
+
+        from .._videoutil.feature import encode_string_query
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         embedder = imagebind_model.imagebind_huge(pretrained=True).to(device)
         embedder.eval()
@@ -140,8 +150,12 @@ class NanoVectorDBVideoSegmentStorage(BaseVectorStorage):
             better_than_threshold=-1,
         )
         results = [
-            {**dp, "id": dp["__id__"], "distance": dp["__metrics__"]} for dp in results
+            {**dp, "id": dp["__id__"], "similarity": float(dp["__metrics__"])}
+            for dp in results
         ]
+        del embedder
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return results
 
     

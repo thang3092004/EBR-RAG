@@ -5,10 +5,75 @@ Author's original graph retrieval logic wrapped for EBR-RAG.
 """
 from typing import Any, List, Optional
 from ..debate.evidence_types import EvidenceItem
-from .formatters import make_segment_evidence, make_entity_evidence
+from .formatters import (
+    _score_from_result,
+    make_graph_packet_evidence,
+    make_segment_evidence,
+    make_entity_evidence,
+)
 from .._op import _refine_entity_retrieval_query, _find_most_related_segments_from_entities
-from .._utils import logger
+from .._utils import encode_string_by_tiktoken, logger
 import asyncio
+
+
+def _get_segment_payload(video_segments, segment_id: str) -> dict | None:
+    if video_segments is None:
+        return None
+    video_name, _, segment_index = str(segment_id).rpartition("_")
+    video_data = getattr(video_segments, "_data", {}).get(video_name, {})
+    payload = video_data.get(segment_index, {}) if isinstance(video_data, dict) else {}
+    if not isinstance(payload, dict):
+        return None
+    return {
+        **payload,
+        "video_name": video_name,
+        "segment_index": segment_index,
+    }
+
+
+async def _search_unified_graph(
+    query: str,
+    entities_vdb,
+    kg,
+    video_segments,
+    top_k: int,
+    global_config: dict,
+) -> List[EvidenceItem]:
+    from .._unified_graph.retrieval import retrieve_graph_packets
+
+    packets = await retrieve_graph_packets(
+        query,
+        entities_vdb,
+        kg,
+        top_k=top_k,
+        seed_k=int(global_config.get("graph_seed_k", 4)),
+        restart_probability=float(
+            global_config.get("graph_restart_probability", 0.15)
+        ),
+        max_path_length=int(global_config.get("graph_max_path_length", 2)),
+        fallback_path_length=int(
+            global_config.get("graph_fallback_path_length", 3)
+        ),
+    )
+    token_cap = int(global_config.get("graph_context_token_cap", 1800))
+    used_tokens = 0
+    evidence = []
+    for packet in packets:
+        payloads = [
+            payload
+            for segment_id in packet.get("provenance_segments", [])
+            if (payload := _get_segment_payload(video_segments, segment_id))
+        ]
+        item = make_graph_packet_evidence(packet, payloads)
+        token_count = len(encode_string_by_tiktoken(item.snippet))
+        if evidence and used_tokens + token_count > token_cap:
+            continue
+        if token_count > token_cap:
+            item.snippet = item.snippet[: max(400, token_cap * 3)]
+            token_count = len(encode_string_by_tiktoken(item.snippet))
+        evidence.append(item)
+        used_tokens += token_count
+    return evidence
 
 async def search_graph_evidence(
     query: str,
@@ -25,6 +90,16 @@ async def search_graph_evidence(
 
     if entities_vdb is None or kg is None:
         return []
+
+    if getattr(kg, "_graph", None) is not None and kg._graph.is_multigraph():
+        return await _search_unified_graph(
+            query,
+            entities_vdb,
+            kg,
+            video_segments,
+            top_k,
+            global_config or {},
+        )
 
     # 1. Refine query for entities
     entity_query = query
@@ -83,8 +158,16 @@ async def search_graph_evidence(
                 if isinstance(segment_payload, dict):
                     segment_payload = {**segment_payload, "video_name": video_name, "segment_index": seg_idx}
             
-            # We use a dummy result dict for the formatter
-            evidence.append(make_segment_evidence({"id": seg_id, "similarity": 0.75}, segment_payload))
+            seed_score = max(
+                (_score_from_result(result) for result in entity_results),
+                default=0.0,
+            )
+            evidence.append(
+                make_segment_evidence(
+                    {"id": seg_id, "similarity": seed_score * 0.8},
+                    segment_payload,
+                )
+            )
     except Exception as e:
         logger.warning(f"[search_graph_evidence] segment extraction failed: {e}")
 

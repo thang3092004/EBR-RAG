@@ -18,7 +18,14 @@ class QueryParam:
     # videorag search
     wo_reference: bool = True
     # EBR_RAG controls
-    ebr_top_k: int = 10           # top-k for initial dual retrieval
+    ebr_top_k: int = 4            # legacy alias for each initial channel
+    initial_text_k: int = 4
+    initial_graph_k: int = 4
+    initial_visual_k: int = 4
+    max_evidence: int = 16
+    max_tool_calls_per_round: int = 2
+    max_total_tool_calls: int = 4
+    graph_context_token_cap: int = 1800
     max_rounds: int = 2           # number of debate rounds (defend + critique cycles)
     return_detailed: bool = False # Set to True to get the full EBR-RAG metadata dict
 

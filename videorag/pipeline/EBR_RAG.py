@@ -21,6 +21,7 @@ from openai import AsyncOpenAI
 from ..tools.text_tools import search_text_evidence
 from ..tools.vision_tools import search_visual_segment
 from ..tools.graph_tools import search_graph_evidence
+from ..tools.fusion import reciprocal_rank_fusion
 from ..tools.schemas import ALL_TOOLS
 from ..debate.debate_manager import run_debate
 from ..debate.state import DebateConfig, DebateState
@@ -133,18 +134,21 @@ async def EBR_RAG_answer(vrag, query: str, param) -> dict:
     # UNIFIED EVIDENCE BUDGETING (Matching Baseline + Debate Bonus)
     # -------------------------------------------------------------------------
     max_rounds: int = getattr(param, "max_rounds", 3)
-    base_top_k: int = 8  # Unified Top-K matching baseline
-    
-    # Stage 1 Retrieval Targets
-    text_k, graph_k, visual_k = base_top_k, base_top_k, base_top_k
+    base_top_k: int = int(getattr(param, "ebr_top_k", 4))
+    text_k = int(getattr(param, "initial_text_k", base_top_k))
+    graph_k = int(getattr(param, "initial_graph_k", base_top_k))
+    visual_k = int(getattr(param, "initial_visual_k", base_top_k))
     global_config["retrieval_topk_chunks"] = text_k
+    global_config["graph_context_token_cap"] = int(
+        getattr(param, "graph_context_token_cap", 1800)
+    )
 
     # --- Stage 1: Initial retrieval ---
     init_evidence = []
     
     # Text evidence
     logger.info(f"[EBR_RAG] Stage 1a — Text retrieval top_k={text_k}")
-    text_ev = await search_text_evidence(query, stores, top_k=text_k, entity_boost=True,
+    text_ev = await search_text_evidence(query, stores, top_k=text_k, entity_boost=False,
                                          global_config=global_config, query_param=param)
     
     # Graph evidence
@@ -157,11 +161,19 @@ async def EBR_RAG_answer(vrag, query: str, param) -> dict:
     visual_ev = await search_visual_segment(query, stores, top_k=visual_k,
                                            global_config=global_config, query_param=param)
 
-    init_evidence = _dedup_evidence(text_ev + graph_ev + visual_ev)
+    init_evidence = reciprocal_rank_fusion(
+        {
+            "text": text_ev[:text_k],
+            "graph": graph_ev[:graph_k],
+            "visual": visual_ev[:visual_k],
+        },
+        limit=text_k + graph_k + visual_k,
+        mmr_lambda=0.75,
+    )
 
     # --- INITIAL TRUNCATION (Pre-Refinement Optimization) ---
     # We limit to the initial budget (24) BEFORE calling the expensive VLM
-    initial_budget_limit = text_k + graph_k + visual_k # 24
+    initial_budget_limit = text_k + graph_k + visual_k
     if len(init_evidence) > initial_budget_limit:
         logger.info(f"[EBR_RAG] Truncating pool {len(init_evidence)} -> {initial_budget_limit} BEFORE refinement.")
         init_evidence = init_evidence[:initial_budget_limit]
@@ -170,9 +182,7 @@ async def EBR_RAG_answer(vrag, query: str, param) -> dict:
     # Only re-caption the items that actually made the cut
     init_evidence = await refine_segment_evidence(init_evidence)
 
-    # --- FINAL UNIVERSAL CAP ---
-    # 24 (Initial) + 9 (Debate: 3 rounds * 3 items) = 33
-    universal_cap = initial_budget_limit + (max_rounds * 3)
+    universal_cap = int(getattr(param, "max_evidence", 16))
     if len(init_evidence) > universal_cap:
         init_evidence = init_evidence[:universal_cap]
 
@@ -190,6 +200,11 @@ async def EBR_RAG_answer(vrag, query: str, param) -> dict:
         model=model_name,
         max_rounds=max_rounds,
         tool_top_k=1, # Defender retrieves 1 item per call
+        max_tool_calls_per_round=int(
+            getattr(param, "max_tool_calls_per_round", 2)
+        ),
+        max_total_tool_calls=int(getattr(param, "max_total_tool_calls", 4)),
+        max_evidence=universal_cap,
         critique_see_evidence=getattr(param, "debate_critique_see_evidence", False),
         defender_disable_tools=getattr(param, "debate_defender_disable_tools", False),
         single_hypothesis=getattr(param, "debate_single_hypothesis", False),

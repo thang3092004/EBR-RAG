@@ -12,6 +12,7 @@ the tai PDF vao `papers/pdf/` neu can nop kem hoac can doc offline.
 Xem danh sach chi tiet tai:
 
 - [entity_anchored_tm_graph_sources.md](entity_anchored_tm_graph_sources.md)
+- [graphrag_retrieval_sources.md](graphrag_retrieval_sources.md)
 
 ## Cach dung trong do an
 

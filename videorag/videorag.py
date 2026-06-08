@@ -46,6 +46,7 @@ from ._storage import (
     NanoVectorDBStorage,
     NanoVectorDBVideoSegmentStorage,
     NetworkXStorage,
+    UnifiedNetworkXStorage,
 )
 from ._utils import (
     EmbeddingFunc,
@@ -103,6 +104,62 @@ class VideoRAG:
     entity_memory_top_k: int = 12
     entity_anchor_storage_dir: str = "entity_anchor"
     entity_anchor_strict: bool = False
+
+    # unified multimodal graph v2
+    use_unified_graph: bool = False
+    pipeline_resume: bool = True
+    asr_model: str = "Systran/faster-distil-whisper-large-v3"
+    asr_device: str = "auto"
+    asr_compute_type: str = ""
+    asr_language: str = ""
+    asr_vad_filter: bool = True
+    asr_beam_size: int = 5
+    shot_detector_threshold: float = 0.38
+    motion_sample_fps: float = 2.0
+    segment_target_seconds: float = 24.0
+    segment_min_seconds: float = 8.0
+    segment_max_seconds: float = 45.0
+    segment_context_seconds: float = 1.5
+    tracking_chunk_seconds: float = 60.0
+    entity_tracking_deep_fps: float = 6.0
+    openclip_model: str = "ViT-B-32"
+    openclip_pretrained: str = "laion2b_s34b_b79k"
+    openclip_batch_size: int = 32
+    visual_merge_threshold: float = 0.85
+    frame_min: int = 2
+    frame_max: int = 6
+    frame_duplicate_threshold: float = 0.94
+    frame_marginal_gain_threshold: float = 0.05
+    modality_visual_threshold: float = 0.35
+    modality_speech_threshold: float = -0.35
+    modality_low_information_threshold: float = 0.20
+    enable_ocr: bool = True
+    ocr_backend: str = "paddleocr"
+    ocr_language: str = "en"
+    enable_diarization: bool = True
+    diarization_model: str = "pyannote/speaker-diarization-3.1"
+    enable_talknet: bool = False
+    talknet_command: str = ""
+    speaker_person_threshold: float = 0.80
+    speaker_person_margin: float = 0.15
+    speaker_person_min_overlap: float = 1.0
+    spacy_model: str = "en_core_web_trf"
+    text_alias_similarity_threshold: float = 0.88
+    caption_model_path: str = "./MiniCPM-V-2_6-int4"
+    caption_device: str = "cuda"
+    caption_attention: str = "sdpa"
+    caption_max_tokens: int = 450
+    caption_max_slice_nums: int = 2
+    entity_memory_recent_events: int = 8
+    unified_graph_namespace: str = "chunk_entity_relation_v2"
+    graph_seed_k: int = 4
+    graph_restart_probability: float = 0.15
+    graph_max_path_length: int = 2
+    graph_fallback_path_length: int = 3
+    graph_context_token_cap: int = 1800
+    graph_provenance_required: bool = True
+    graph_allow_provisional_nodes: bool = False
+    keep_segment_cache: bool = False
     
     # query
     retrieval_topk_chunks: int = 8 # Ablation: Tweak baseline to 8
@@ -153,7 +210,7 @@ class VideoRAG:
     def load_caption_model(self, debug=False):
         # caption model
         if not debug:
-            model_path = os.path.abspath("./MiniCPM-V-2_6-int4")
+            model_path = os.path.abspath(self.caption_model_path)
             if not os.path.exists(model_path):
                 model_path = "openbmb/MiniCPM-V-2_6-int4"
             self.caption_model = AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="cuda", attn_implementation="sdpa")
@@ -171,15 +228,22 @@ class VideoRAG:
             logger.info(f"Creating working directory {self.working_dir}")
             os.makedirs(self.working_dir)
 
+        if self.use_unified_graph:
+            ns_suffix = "_v2"
+        else:
+            ns_suffix = "_tm" if self.use_tm_graph else ""
+        media_suffix = "_v2" if self.use_unified_graph else ""
+
         self.video_path_db = self.key_string_value_json_storage_cls(
-            namespace="video_path", global_config=asdict(self)
+            namespace=f"video_path{media_suffix}", global_config=asdict(self)
         )
         
         self.video_segments = self.key_string_value_json_storage_cls(
-            namespace="video_segments", global_config=asdict(self)
+            namespace=f"video_segments{media_suffix}", global_config=asdict(self)
         )
 
-        ns_suffix = "_tm" if self.use_tm_graph else ""
+        if self.use_unified_graph and self.graph_storage_cls is NetworkXStorage:
+            self.graph_storage_cls = UnifiedNetworkXStorage
 
         self.text_chunks = self.key_string_value_json_storage_cls(
             namespace=f"text_chunks{ns_suffix}", global_config=asdict(self)
@@ -194,7 +258,12 @@ class VideoRAG:
         )
 
         self.chunk_entity_relation_graph = self.graph_storage_cls(
-            namespace=f"chunk_entity_relation{ns_suffix}", global_config=asdict(self)
+            namespace=(
+                self.unified_graph_namespace
+                if self.use_unified_graph
+                else f"chunk_entity_relation{ns_suffix}"
+            ),
+            global_config=asdict(self),
         )
 
         self.embedding_func = limit_async_func_call(self.llm.embedding_func_max_async)(wrap_embedding_func_with_attrs(
@@ -223,7 +292,7 @@ class VideoRAG:
         
         self.video_segment_feature_vdb = (
             self.vs_vector_db_storage_cls(
-                namespace="video_segment_feature",
+                namespace=f"video_segment_feature{media_suffix}",
                 global_config=asdict(self),
                 embedding_func=None, # we code the embedding process inside the insert() function.
             )
@@ -236,7 +305,7 @@ class VideoRAG:
             partial(self.llm.cheap_model_func, hashing_kv=self.llm_response_cache)
         )
         
-        if self.use_tm_graph:
+        if self.use_tm_graph and not self.use_unified_graph:
             from ._op import extract_entities_tm
             self.entity_extraction_func = extract_entities_tm
 
@@ -290,7 +359,25 @@ class VideoRAG:
                 for index, data in existing_data.items()
             } if existing_data else {}
 
-    def insert_video(self, video_path_list=None):
+    def insert_video(
+        self,
+        video_path_list=None,
+        *,
+        resume: bool | None = None,
+        restart_stage: str | None = None,
+        force: bool = False,
+    ):
+        if self.use_unified_graph:
+            from .pipeline.unified_ingest import UnifiedIngestPipeline
+
+            pipeline = UnifiedIngestPipeline(
+                self,
+                resume=self.pipeline_resume if resume is None else resume,
+                restart_stage=restart_stage,
+                force=force,
+            )
+            return pipeline.run(list(video_path_list or []))
+
         loop = always_get_an_event_loop()
         for video_path in tqdm(video_path_list, desc="Ingesting videos", unit="video"):
             # Step0: check the existence

@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Optional, Literal
 
-EvidenceType = Literal["text", "entity", "segment"]
+EvidenceType = Literal["text", "entity", "segment", "graph"]
 
 
 @dataclass
@@ -28,5 +28,7 @@ class EvidenceItem:
             "video_name": self.video_name,
             "segment_index": self.segment_index,
             "time_range": self.time_range,
+            "provenance_path": self.provenance_path,
             "validated": self.validated,
+            "metadata": self.metadata,
         }

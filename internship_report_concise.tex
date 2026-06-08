@@ -1,0 +1,342 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[a4paper,top=2.5cm,bottom=2.5cm,left=3cm,right=2.2cm]{geometry}
+\usepackage{fontspec}
+\usepackage{setspace}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xurl}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{caption}
+
+\setmainfont{Times New Roman}
+\setstretch{1.14}
+\hypersetup{colorlinks=false,pdfborder={0 0 0}}
+
+\titleformat{\section}{\normalfont\Large\bfseries}{\thesection}{0.8em}{}
+\titleformat{\subsection}{\normalfont\large\bfseries}{\thesubsection}{0.8em}{}
+\titlespacing*{\section}{0pt}{1.05em}{0.55em}
+\titlespacing*{\subsection}{0pt}{0.75em}{0.35em}
+
+\setlength{\parindent}{1.2cm}
+\setlength{\parskip}{0.1em}
+\emergencystretch=2em
+\sloppy
+\setlist[itemize]{leftmargin=1.6cm,itemsep=0.05em,topsep=0.1em}
+\setlist[enumerate]{leftmargin=1.6cm,itemsep=0.05em,topsep=0.1em}
+\newcommand{\codepath}[1]{\path{#1}}
+\renewcommand{\arraystretch}{1.12}
+\renewcommand{\refname}{Tài liệu tham khảo}
+
+\begin{document}
+
+\begin{titlepage}
+  \thispagestyle{empty}
+
+  \begin{center}
+    \textbf{Hà Nội, ngày 01 tháng 06 năm 2026}
+
+    \vspace{1.35cm}
+
+    {\Large\bfseries BÁO CÁO}
+  \end{center}
+
+  \vspace{0.7cm}
+
+  \noindent\textbf{Kính gửi:} Trường Công nghệ thông tin và Truyền thông, Đại học Bách khoa Hà Nội
+
+  \vspace{0.55cm}
+
+  \noindent\textbf{Họ và tên sinh viên:} Nguyễn Tiến Thắng \hfill \textbf{MSSV:} 20225530
+
+  \vspace{0.2cm}
+
+  \noindent\textbf{Lớp, Khóa:} DSAI 01 -- K67
+
+  \vspace{0.2cm}
+
+  \noindent\textbf{Điện thoại:} 0827.423.931 \hfill \textbf{Email:} thang.nt225530@sis.hust.edu.vn
+
+  \vspace{0.2cm}
+
+  \noindent\textbf{Địa chỉ đến thực tập:} NLP Lab
+
+  \vspace{0.2cm}
+
+  \noindent\textbf{Thời gian được cử đi thực tập:} từ ngày 21/02/2026 đến ngày 01/06/2026
+
+  \vspace{0.2cm}
+
+  \noindent\textbf{Người hướng dẫn tại đơn vị thực tập:} PGS.TS. Lê Thanh Hương
+
+  \vspace{0.9cm}
+
+  \noindent\textbf{I. Nội dung công việc được giao:}
+
+  \vspace{0.3cm}
+
+  \noindent\textbf{Tên đề tài:} \textit{EBR-RAG: Multi-Agent Debate for Retrieval-Augmented Generation on Extreme Long-Context Videos}
+
+  \vspace{0.45cm}
+
+  \noindent Báo cáo thực tập trình bày quá trình thực hiện đề tài tại NLP Lab. Nội dung tập trung vào nghiên cứu kiến trúc VideoRAG cho video dài, khảo sát hạn chế của RAG truyền thống, cải tiến graph construction bằng TM-Graph, phát triển cơ chế Multi-Agent Debate cho giai đoạn sinh câu trả lời, và tích hợp pipeline từ Ingestion đến Generation.
+
+  \vspace{0.3cm}
+
+  \noindent Kết quả chính gồm: nắm vững nền tảng RAG đa phương thức, tích hợp TM-Graph vào quy trình xử lý đồ thị, phát triển module debate nhằm cải thiện chất lượng trả lời cho video dài, và hoàn thiện các script ingest, ablation và đánh giá định lượng. Phần RAGAS và benchmark score đang được tiếp tục hoàn thiện.
+
+  \vfill
+
+  \begin{center}
+    \textit{Báo cáo thực tập tại NLP Lab}
+  \end{center}
+\end{titlepage}
+
+\section{Giới thiệu}
+
+Retrieval-Augmented Generation (RAG) là hướng tiếp cận quan trọng giúp mô hình ngôn ngữ lớn trả lời dựa trên tri thức bên ngoài thay vì chỉ dựa vào tri thức trong tham số. Với các bài toán văn bản, RAG thường chia tài liệu thành các đoạn nhỏ, mã hóa thành vector, truy xuất các đoạn liên quan và sinh câu trả lời từ các đoạn đó. Tuy nhiên, khi chuyển sang dữ liệu video dài, bài toán trở nên khó hơn nhiều vì video không chỉ có transcript mà còn có thông tin thị giác, âm thanh, hành động, bối cảnh, nhân vật, slide và các sự kiện trải dài theo thời gian.
+
+Các hệ thống hỏi đáp truyền thống hoặc RAG văn bản thuần túy gặp ba hạn chế chính khi xử lý video dài. Thứ nhất, việc đưa toàn bộ transcript/caption của nhiều giờ video vào mô hình là tốn kém và dễ vượt quá giới hạn ngữ cảnh. Thứ hai, dense retrieval trên text chunks có thể bỏ sót quan hệ gián tiếp giữa các đoạn hoặc các thông tin chỉ xuất hiện trong hình ảnh. Thứ ba, generation một lượt dễ tạo câu trả lời thiếu kiểm chứng khi evidence ban đầu chưa đầy đủ hoặc chứa nhiễu.
+
+Vì vậy, đề tài \textit{EBR-RAG: Multi-Agent Debate for Retrieval-Augmented Generation on Extreme Long-Context Videos} được thực hiện nhằm mở rộng VideoRAG baseline \cite{ren2025videorag}. Hướng tiếp cận chính là kết hợp Video RAG, Graph-based RAG và Multi-Agent Debate. Video RAG xử lý dữ liệu đa phương thức; graph giúp liên kết entity/relation qua nhiều đoạn video; còn debate giúp câu trả lời được phản biện, bổ sung evidence và tổng hợp cẩn thận hơn trước khi đưa ra kết luận.
+
+Trong kỳ thực tập, em tập trung vào các công việc:
+\begin{itemize}
+  \item Nghiên cứu pipeline VideoRAG baseline và benchmark LongerVideos.
+  \item Tìm hiểu Graph-based RAG cho long-context video QA.
+  \item Tích hợp TM-Graph vào quá trình tạo graph và chuẩn bị ablation với graph baseline.
+  \item Phát triển pipeline EBR-RAG gồm retrieval đa nguồn và Multi-Agent Debate.
+  \item Chuẩn bị script ingest, ablation, đánh giá generation và đánh giá retrieval bằng RAGAS.
+\end{itemize}
+
+\section{Cơ sở và tài nguyên sử dụng}
+
+\subsection{VideoRAG baseline}
+
+VideoRAG là framework RAG cho extreme long-context videos \cite{ren2025videorag}. Điểm nổi bật của hệ thống là kiến trúc dual-channel: một nhánh xây dựng graph-based textual knowledge grounding để mô hình hóa quan hệ ngữ nghĩa giữa các video/chunks, nhánh còn lại lưu biểu diễn đa phương thức của video segments để giữ thông tin thị giác và thời gian. Khi nhận câu hỏi, VideoRAG kết hợp truy xuất dựa trên text, entity/graph và visual segment để tạo evidence cho generation.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.86\textwidth]{VideoRAG.png}
+  \caption{Kiến trúc tổng quan của VideoRAG baseline.}
+\end{figure}
+
+Benchmark chính được tham chiếu là LongerVideos, gồm 164 video với tổng thời lượng khoảng 134.6 giờ, chia thành lecture, documentary và entertainment. Trong quá trình phát triển, project chọn một số collection đại diện như \codepath{19-jeff-bezos}, \codepath{6-daubechies-wavelet-lecture} và \codepath{11-primetime-emmy-awards} để ingest và kiểm thử nhanh.
+
+\begin{center}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Video Type} & \textbf{\#list} & \textbf{\#video} & \textbf{\#query} & \textbf{Duration} \\
+\midrule
+Lecture & 12 & 135 & 376 & $\sim$64.3h \\
+Documentary & 5 & 12 & 114 & $\sim$28.5h \\
+Entertainment & 5 & 17 & 112 & $\sim$41.9h \\
+\textbf{All} & \textbf{22} & \textbf{164} & \textbf{602} & \textbf{$\sim$134.6h} \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Thống kê benchmark LongerVideos trong VideoRAG baseline.}
+\end{center}
+
+\subsection{Các bài báo tham khảo chính}
+
+Bên cạnh VideoRAG, project tham khảo một số bài báo trực tiếp liên quan đến debate, RAG và graph-based video reasoning.
+
+\begin{center}
+\small
+\begin{tabular}{p{0.29\textwidth}p{0.53\textwidth}}
+\toprule
+\textbf{Bài báo} & \textbf{Vai trò trong đề tài} \\
+\midrule
+VideoRAG \cite{ren2025videorag} & Baseline chính cho RAG trên extreme long-context videos và benchmark LongerVideos. \\
+Multiagent Debate \cite{du2023multiagent} & Nền tảng cho thiết kế nhiều vai trò phản biện trong generation. \\
+Breaking the Martingale Curse \cite{liu2026martingale} & Cơ sở lý thuyết cho bất đối xứng thông tin giữa các agent, đặc biệt là không đưa full evidence cho Critique Agent mặc định. \\
+Debate-Augmented RAG \cite{hu2025drag} & Bài liên quan gần trong text RAG, dùng asymmetric information roles và adversarial debate để giảm hallucination do retrieval noise. \\
+Vgent \cite{shen2025vgent} & Bài tham khảo gần với TM-Graph ở hướng graph-based long-video RAG, nhưng khác cách triển khai. \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Các tài liệu tham khảo chính.}
+\end{center}
+
+\subsection{Môi trường và mã nguồn}
+
+Project được phát triển bằng Python trên mã nguồn VideoRAG. Các thành phần quan trọng gồm \codepath{videorag/videorag.py} để điều phối ingestion/query, \codepath{videorag/pipeline/EBR_RAG.py} để chạy pipeline EBR-RAG, \codepath{videorag/tools/} để truy xuất text/graph/visual evidence, \codepath{videorag/debate/} để điều phối Multi-Agent Debate, và \codepath{reproduce/} để chạy ablation/evaluation. Cấu hình ingest hiện dùng \codepath{text-embedding-3-small} cho embedding và \codepath{gpt-4o-mini} cho các bước LLM.
+
+\section{Phương pháp thực hiện}
+
+\subsection{Ingestion và Indexing}
+
+Trong VideoRAG, mỗi video được tách thành các segment ngắn, mặc định 30 giây. Hệ thống chạy ASR để lấy transcript, chạy captioning để tạo mô tả thị giác, sau đó hợp nhất transcript và caption thành nội dung segment. Các segment được lưu vào key-value storage, đồng thời đặc trưng video segment được mã hóa và lưu vào video segment feature VDB để phục vụ visual retrieval.
+
+Sau khi có thông tin segment, hệ thống tạo text chunks, đưa chunks vào vector database, trích xuất entity/relation và cập nhật knowledge graph. Project giữ cơ chế cache/resume của VideoRAG: nếu segment, transcript, caption hoặc visual feature đã tồn tại thì bỏ qua bước tương ứng. Điều này giúp tiết kiệm thời gian khi chạy lại thí nghiệm hoặc ablation.
+
+\subsection{Graph-based RAG và TM-Graph}
+
+Graph-based RAG biểu diễn tri thức bằng node và edge. Với video dài, graph giúp liên kết các thông tin rời rạc qua entity và relation, từ đó hỗ trợ truy xuất các segment liên quan dù chúng không có embedding trực tiếp gần với câu hỏi. Hướng này phù hợp với các nghiên cứu graph-based video RAG gần đây như Vgent \cite{shen2025vgent}, nơi graph được dùng để tăng hiệu quả retrieval-reasoning cho long video understanding.
+
+Trong project này, TM-Graph được tích hợp như một biến thể của quá trình tạo graph trong VideoRAG. Khi bật \codepath{use_tm_graph=True}, hệ thống dùng entity extraction function mới và lưu dữ liệu vào namespace riêng có hậu tố \codepath{_tm}. Nhờ vậy, có thể giữ song song graph baseline và TM-Graph trong cùng working directory để so sánh ablation. Khác với Vgent, TM-Graph không thêm một reasoning module mới trên LVLM, mà tập trung cải thiện graph construction/entity extraction trong pipeline VideoRAG.
+
+\subsection{Pipeline EBR-RAG}
+
+Pipeline EBR-RAG được gọi khi \codepath{param.mode == "EBR_RAG"}. Pipeline xây dựng evidence pool từ ba nguồn:
+\begin{itemize}
+  \item \textbf{Text retrieval}: rewrite query, truy xuất dense chunks và mở rộng qua entity/graph.
+  \item \textbf{Graph retrieval}: tìm entity liên quan trong entity VDB, lấy node data trong graph và tìm segment liên quan.
+  \item \textbf{Visual retrieval}: rewrite query theo hướng thị giác và truy xuất video segment từ video segment feature VDB.
+\end{itemize}
+
+Trong cấu hình hiện tại, mỗi nhánh dùng \codepath{top_k=8}. Evidence được gộp, loại trùng và giới hạn initial budget ở 24 items. Nếu có caption model, pipeline refine các segment bằng query-aware re-captioning. Sau đó evidence được chuyển sang Multi-Agent Debate để sinh câu trả lời cuối cùng. Output chi tiết gồm \codepath{answer}, \codepath{rationale}, \codepath{confidence}, \codepath{citations}, \codepath{transcript}, \codepath{evidence}, số round và số tool call.
+
+\subsection{Multi-Agent Debate}
+
+Multi-Agent Debate là phần mở rộng chính ở giai đoạn generation. Ý tưởng chung là thay vì để một mô hình sinh câu trả lời trực tiếp, nhiều vai trò sẽ tham gia vào quá trình draft, phản biện, sửa đổi và tổng hợp. Thiết kế này lấy cảm hứng từ hướng multi-agent debate, vốn cho thấy debate có thể cải thiện factuality và reasoning \cite{du2023multiagent}.
+
+Pipeline hiện tại gồm bốn vai trò:
+\begin{itemize}
+  \item \textbf{Generator}: tạo draft ban đầu từ evidence pool.
+  \item \textbf{Critique Agent}: tìm điểm yếu, thiếu bằng chứng hoặc dấu hiệu hallucination trong draft.
+  \item \textbf{Defender Agent}: phản hồi critique, gọi tool retrieval nếu cần và cập nhật draft.
+  \item \textbf{Judge}: tổng hợp transcript và evidence pool để đưa ra answer cuối.
+\end{itemize}
+
+Một lựa chọn thiết kế quan trọng là Critique Agent mặc định không nhìn trực tiếp toàn bộ evidence pool. Nếu mọi agent cùng nhìn một evidence pool nhiễu, debate có thể hội tụ về cùng một sai lầm. Bài \textit{Breaking the Martingale Curse} phân tích nguy cơ correlated errors trong debate và đề xuất khai thác bất đối xứng thông tin/cognitive potential để tạo hướng hội tụ tốt hơn \cite{liu2026martingale}. Trong RAG, DRAG cũng dùng asymmetric information roles để giảm hallucination do retrieval noise \cite{hu2025drag}. Vì vậy, EBR-RAG để Critique phản biện draft tương đối độc lập; kịch bản \textit{Critique with Evidence} được giữ lại để ablation.
+
+\subsection{Các module đã triển khai}
+
+Trong mã nguồn, các phần mở rộng được tách thành các module nhỏ để dễ kiểm thử và dễ chạy ablation. Cách tổ chức này giúp project không phải viết lại toàn bộ VideoRAG baseline mà chỉ can thiệp vào các điểm cần mở rộng: graph construction, retrieval tools và generation pipeline.
+
+\begin{center}
+\small
+\begin{tabular}{p{0.31\textwidth}p{0.51\textwidth}}
+\toprule
+\textbf{Module} & \textbf{Chức năng chính} \\
+\midrule
+\codepath{videorag/pipeline/EBR_RAG.py} & Điều phối EBR-RAG: lấy storage handles, chạy retrieval đa nguồn, dedup evidence, giới hạn budget, gọi debate và trả output có cấu trúc. \\
+\codepath{videorag/tools/text_tools.py} & Truy xuất text evidence bằng dense chunks và entity/graph expansion. \\
+\codepath{videorag/tools/graph_tools.py} & Truy xuất entity trong graph, lấy node data và tìm segment liên quan. \\
+\codepath{videorag/tools/vision_tools.py} & Truy xuất visual segment evidence từ video segment feature VDB. \\
+\codepath{videorag/debate/debate_manager.py} & Điều phối Generator, Critique, Defender, Judge; quản lý transcript, tool-call và state. \\
+\codepath{reproduce/run_ablation_matrix.py} & Chạy các kịch bản ablation, lưu answer và hỗ trợ resume. \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Các module chính được triển khai hoặc mở rộng.}
+\end{center}
+
+Output chi tiết của EBR-RAG được thiết kế để phục vụ cả người dùng và đánh giá. Ngoài \codepath{answer}, pipeline còn trả \codepath{rationale}, \codepath{confidence}, \codepath{citations}, \codepath{transcript}, \codepath{evidence}, số round debate đã chạy và số tool call đã thực hiện. Nhờ đó, khi kết quả sai hoặc thiếu bằng chứng, có thể truy ngược lại evidence pool và transcript để xem lỗi nằm ở retrieval, critique, defender hay judge.
+
+\section{Thực nghiệm và kết quả hiện tại}
+
+\subsection{Thiết lập thực nghiệm}
+
+Thực nghiệm được chuẩn bị trên các collection đại diện trong LongerVideos. Script \codepath{run_ingest.py} ingest video và lưu working directory riêng cho từng collection. Script \codepath{reproduce/run_ablation_matrix.py} chạy các biến thể của EBR-RAG và lưu answer theo format tương thích với benchmark gốc. Các kịch bản ablation chính gồm:
+
+\begin{center}
+\small
+\begin{tabular}{p{0.28\textwidth}p{0.52\textwidth}}
+\toprule
+\textbf{Kịch bản} & \textbf{Ý nghĩa} \\
+\midrule
+Full Framework & TM-Graph + Multi-Agent Debate đầy đủ. \\
+Baseline with Debate & Giữ debate nhưng dùng graph baseline để đo ảnh hưởng của TM-Graph. \\
+w/o Debate & Dùng TM-Graph nhưng tắt debate để đo đóng góp của Multi-Agent Debate. \\
+Critique with Evidence & Cho Critique nhìn evidence để kiểm tra lựa chọn bất đối xứng thông tin. \\
+Defender No Tools & Tắt tool-calling của Defender để đo vai trò của việc tìm thêm evidence. \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Các kịch bản ablation chính.}
+\end{center}
+
+Đánh giá được chia thành hai phần. Đối với generation, project sử dụng metrics của benchmark gốc trong bài VideoRAG. Đối với retrieval, project dùng RAGAS để đo \textit{context precision} và \textit{context recall}. Phần RAGAS chưa chạy xong nên các giá trị định lượng được giữ là TBD để cập nhật sau.
+
+Trong đánh giá generation, mục tiêu là so sánh chất lượng câu trả lời của EBR-RAG với các baseline theo cùng format output của benchmark. Vì vậy, script ablation chỉ lưu phần answer dạng plain text để tương thích với các script đánh giá có sẵn. Trong đánh giá retrieval, mục tiêu không phải chấm câu trả lời cuối mà là chấm chất lượng context được đưa vào generation. Context precision cho biết tỷ lệ context truy xuất thực sự liên quan đến câu hỏi; context recall cho biết mức độ context đã bao phủ thông tin cần thiết. Hai chỉ số này đặc biệt hữu ích để kiểm tra TM-Graph vì chúng tách ảnh hưởng của retrieval khỏi ảnh hưởng của LLM generation.
+
+\subsection{Kết quả thực hiện}
+
+Về mặt triển khai, project đã hoàn thành các hạng mục chính. Thứ nhất, em đã khảo sát VideoRAG baseline theo từng bước: video segmentation, transcript/caption extraction, chunking, embedding, graph construction, retrieval và generation. Thứ hai, TM-Graph đã được tích hợp qua flag \codepath{use_tm_graph}, có namespace riêng để chạy song song với graph baseline. Thứ ba, pipeline EBR-RAG đã được thêm như một query mode mới, kết hợp retrieval đa nguồn và debate. Thứ tư, module Multi-Agent Debate đã được triển khai với state tracking, transcript, tool-calling và các cấu hình phục vụ ablation.
+
+Về mặt vận hành, pipeline hiện hỗ trợ chạy lại thí nghiệm tương đối thuận tiện. Ingestion có cơ chế bỏ qua các video/segment đã xử lý đầy đủ, giúp giảm chi phí khi thử nhiều cấu hình. Ablation script có resume logic: nếu file answer đã tồn tại thì bỏ qua, nếu answer rỗng hoặc pipeline lỗi thì dừng ngay để tránh ghi dữ liệu sai. Đây là điểm quan trọng vì với video dài, một lỗi nhỏ trong ingestion hoặc graph construction có thể ảnh hưởng dây chuyền tới toàn bộ retrieval và generation.
+
+Các bảng kết quả định lượng hiện được giữ ở dạng placeholder:
+
+\begin{center}
+\small
+\begin{tabular}{p{0.28\textwidth}p{0.2\textwidth}ccc}
+\toprule
+\textbf{Method} & \textbf{Retrieval Config} & \textbf{N} & \textbf{Precision} & \textbf{Recall} \\
+\midrule
+Full Framework & TM-Graph & TBD & TBD & TBD \\
+Baseline with Debate & Baseline Graph & TBD & TBD & TBD \\
+w/o Debate & TM-Graph & TBD & TBD & TBD \\
+Defender No Tools & TM-Graph & TBD & TBD & TBD \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Bảng RAGAS retrieval dự kiến.}
+\end{center}
+
+\begin{center}
+\small
+\begin{tabular}{p{0.42\textwidth}p{0.18\textwidth}p{0.22\textwidth}}
+\toprule
+\textbf{Method} & \textbf{Score} & \textbf{Ghi chú} \\
+\midrule
+NaiveRAG baseline & TBD & Baseline tham chiếu \\
+VideoRAG baseline & TBD & Benchmark gốc \\
+EBR-RAG Full Framework & TBD & TM-Graph + Debate \\
+EBR-RAG w/o Debate & TBD & Đo đóng góp debate \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Bảng generation evaluation dự kiến.}
+\end{center}
+
+\subsection{Thảo luận}
+
+Qua quá trình triển khai, có thể thấy bài toán video dài cần pipeline nhiều tầng. Nếu chỉ cải thiện generation mà retrieval yếu, câu trả lời vẫn thiếu grounding. Graph giúp mở rộng evidence qua quan hệ giữa entity và segment, trong khi visual retrieval bổ sung thông tin không xuất hiện rõ trong transcript. Multi-Agent Debate giúp kiểm tra draft, bổ sung evidence khi cần và giảm nguy cơ trả lời một lượt quá tự tin.
+
+Tuy nhiên, hệ thống vẫn có hạn chế. Debate làm tăng số lần gọi LLM và độ trễ. Chất lượng graph phụ thuộc vào entity extraction, còn visual evidence phụ thuộc vào captioning và embedding video segment. Nếu evidence ban đầu quá nhiễu, debate có thể vẫn bị ảnh hưởng. Vì vậy, các hướng tối ưu tiếp theo cần tập trung vào evidence selection, reranking và cơ chế dừng debate sớm.
+
+\section{Kết luận và hướng phát triển}
+
+Trong kỳ thực tập tại NLP Lab, em đã nghiên cứu và mở rộng VideoRAG cho bài toán RAG trên extreme long-context videos. Các kết quả chính gồm: hiểu kiến trúc VideoRAG baseline, tích hợp TM-Graph vào graph construction, phát triển pipeline EBR-RAG với retrieval đa nguồn, xây dựng module Multi-Agent Debate và chuẩn bị script ingest/ablation/evaluation.
+
+Về mặt kiến thức, đề tài giúp em nắm rõ hơn các vấn đề cốt lõi của RAG đa phương thức: truy xuất bằng chứng, biểu diễn tri thức bằng graph, grounding câu trả lời và kiểm soát hallucination trong generation. Về mặt sản phẩm, project đã có query mode \codepath{EBR_RAG}, các retrieval tools cho text/graph/visual evidence, debate manager nhiều vòng và hệ thống ablation để kiểm tra đóng góp của từng thành phần.
+
+Trong thời gian tiếp theo, cần hoàn tất chạy RAGAS và benchmark evaluation để cập nhật các bảng TBD. Ngoài ra, có thể tối ưu chi phí debate bằng early stopping, cải thiện TM-Graph theo hướng temporal reasoning rõ hơn, thêm reranking evidence trước debate, và tăng chất lượng citation bằng cách bắt Judge trích dẫn evidence id kèm time range. Những cải tiến này sẽ giúp EBR-RAG trở nên hiệu quả và dễ kiểm chứng hơn trong các bài toán video dài thực tế.
+
+\begin{thebibliography}{9}
+
+\bibitem{ren2025videorag}
+Xubin Ren, Lingrui Xu, Long Xia, Shuaiqiang Wang, Dawei Yin, and Chao Huang.
+\textit{VideoRAG: Retrieval-Augmented Generation with Extreme Long-Context Videos}.
+arXiv:2502.01549, 2025.
+\url{https://arxiv.org/abs/2502.01549}
+
+\bibitem{du2023multiagent}
+Yilun Du, Shuang Li, Antonio Torralba, Joshua B. Tenenbaum, and Igor Mordatch.
+\textit{Improving Factuality and Reasoning in Language Models through Multiagent Debate}.
+arXiv:2305.14325, 2023.
+\url{https://arxiv.org/abs/2305.14325}
+
+\bibitem{liu2026martingale}
+Yuhan Liu, Juntian Zhang, Yichen Wu, Martin Takáč, Salem Lahlou, Xiuying Chen, and Nils Lukas.
+\textit{Breaking the Martingale Curse: Multi-Agent Debate via Asymmetric Cognitive Potential Energy}.
+arXiv:2603.06801, 2026.
+\url{https://arxiv.org/abs/2603.06801}
+
+\bibitem{hu2025drag}
+Wentao Hu, Wengyu Zhang, Yiyang Jiang, Chen Jason Zhang, Xiaoyong Wei, and Qing Li.
+\textit{Removal of Hallucination on Hallucination: Debate-Augmented RAG}.
+arXiv:2505.18581, 2025.
+\url{https://arxiv.org/abs/2505.18581}
+
+\bibitem{shen2025vgent}
+Xiaoqian Shen, Wenxuan Zhang, Jun Chen, and Mohamed Elhoseiny.
+\textit{Vgent: Graph-based Retrieval-Reasoning-Augmented Generation For Long Video Understanding}.
+arXiv:2510.14032, 2025.
+\url{https://arxiv.org/abs/2510.14032}
+
+\end{thebibliography}
+
+\end{document}

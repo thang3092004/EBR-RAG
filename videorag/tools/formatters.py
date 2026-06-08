@@ -62,3 +62,48 @@ def make_segment_evidence(result: dict, segment_payload: dict[str, Any] | None) 
         time_range=time_range,
         metadata={k: v for k, v in result.items() if k not in {"id", "distance", "similarity"}},
     )
+
+
+def make_graph_packet_evidence(
+    packet: dict[str, Any],
+    segment_payloads: list[dict[str, Any]] | None = None,
+) -> EvidenceItem:
+    edge_lines = []
+    for edge in packet.get("edges", []):
+        edge_lines.append(
+            f"{edge.get('source_node')} --{edge.get('predicate', 'related_to')}--> "
+            f"{edge.get('target_node')}"
+        )
+    source_lines = []
+    for payload in segment_payloads or []:
+        content = str(payload.get("content", "")).strip()
+        if content:
+            source_lines.append(
+                f"[{payload.get('video_name')}:{payload.get('segment_index')} "
+                f"{payload.get('time', '')}] {content}"
+            )
+    snippet = "\n".join(
+        [
+            "Graph path: " + " -> ".join(packet.get("nodes", [])),
+            *edge_lines,
+            *source_lines,
+        ]
+    ).strip()
+    return EvidenceItem(
+        id=str(packet.get("packet_id")),
+        type="graph",
+        score=float(packet.get("score", 0.0)),
+        snippet=snippet,
+        source="unified_graph",
+        time_range=(
+            "-".join(str(value) for value in packet["time_span"])
+            if packet.get("time_span")
+            else None
+        ),
+        provenance_path=" -> ".join(packet.get("nodes", [])),
+        metadata={
+            "nodes": packet.get("nodes", []),
+            "edges": packet.get("edges", []),
+            "provenance_segments": packet.get("provenance_segments", []),
+        },
+    )

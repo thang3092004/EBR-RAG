@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+from .stage_runner import StageDefinition
+
+
+UNIFIED_STAGE_DEFINITIONS = [
+    StageDefinition(
+        "probe",
+        config_keys=(
+            "video_output_format",
+            "audio_output_format",
+            "input_path",
+            "input_size_bytes",
+            "input_mtime_ns",
+        ),
+    ),
+    StageDefinition(
+        "asr",
+        dependencies=("probe",),
+        config_keys=(
+            "asr_model",
+            "asr_device",
+            "asr_compute_type",
+            "asr_language",
+            "asr_vad_filter",
+        ),
+    ),
+    StageDefinition(
+        "shot_detection",
+        dependencies=("probe",),
+        config_keys=("shot_detector_threshold", "motion_sample_fps"),
+    ),
+    StageDefinition(
+        "segmentation",
+        dependencies=("asr", "shot_detection"),
+        config_keys=(
+            "segment_target_seconds",
+            "segment_min_seconds",
+            "segment_max_seconds",
+            "segment_context_seconds",
+        ),
+    ),
+    StageDefinition(
+        "tracking_base",
+        dependencies=("segmentation",),
+        config_keys=(
+            "entity_tracking_model",
+            "entity_tracking_tracker",
+            "entity_tracking_fps",
+            "entity_tracking_conf",
+            "entity_tracking_iou",
+            "entity_tracking_imgsz",
+            "tracking_chunk_seconds",
+        ),
+    ),
+    StageDefinition(
+        "modality_profile",
+        dependencies=("segmentation", "tracking_base", "shot_detection"),
+        config_keys=(
+            "modality_visual_threshold",
+            "modality_speech_threshold",
+            "modality_low_information_threshold",
+        ),
+    ),
+    StageDefinition(
+        "deep_processing",
+        dependencies=("modality_profile",),
+        config_keys=(
+            "entity_tracking_deep_fps",
+            "frame_min",
+            "frame_max",
+            "frame_duplicate_threshold",
+            "frame_marginal_gain_threshold",
+            "enable_ocr",
+            "ocr_backend",
+        ),
+    ),
+    StageDefinition(
+        "speaker_linking",
+        dependencies=("asr", "segmentation", "deep_processing"),
+        config_keys=(
+            "enable_diarization",
+            "diarization_model",
+            "enable_talknet",
+            "talknet_command",
+            "speaker_person_threshold",
+            "speaker_person_margin",
+            "speaker_person_min_overlap",
+        ),
+    ),
+    StageDefinition(
+        "text_entities",
+        dependencies=("speaker_linking", "segmentation"),
+        config_keys=(
+            "spacy_model",
+            "text_alias_similarity_threshold",
+        ),
+    ),
+    StageDefinition(
+        "alignment_caption",
+        dependencies=(
+            "deep_processing",
+            "text_entities",
+            "speaker_linking",
+        ),
+        config_keys=(
+            "caption_model_path",
+            "caption_max_tokens",
+            "caption_max_slice_nums",
+            "entity_memory_recent_events",
+        ),
+    ),
+    StageDefinition(
+        "graph_build",
+        dependencies=("alignment_caption",),
+        config_keys=("unified_graph_namespace",),
+    ),
+    StageDefinition(
+        "embedding_index",
+        dependencies=("graph_build",),
+        config_keys=(
+            "video_embedding_batch_num",
+            "video_embedding_dim",
+        ),
+    ),
+    StageDefinition(
+        "validation",
+        dependencies=("embedding_index",),
+        config_keys=(
+            "graph_provenance_required",
+            "graph_allow_provisional_nodes",
+        ),
+    ),
+]

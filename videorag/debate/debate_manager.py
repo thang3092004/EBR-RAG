@@ -223,15 +223,20 @@ async def _refine_draft(
         )},
     ]
 
-    max_calls = 3
+    max_calls = cfg.max_tool_calls_per_round
     calls_made = 0
-    # Use the universal cap from config (default 52) to ensure fairness
-    evidence_cap = getattr(cfg, "universal_cap", 52)
+    evidence_cap = cfg.max_evidence
+    available_tools = None if cfg.defender_disable_tools else tools
 
-    while calls_made < max_calls and state.tool_calls_made < 25 and len(state.evidence) < evidence_cap:
+    while (
+        calls_made < max_calls
+        and state.tool_calls_made < cfg.max_total_tool_calls
+        and len(state.evidence) < evidence_cap
+    ):
         resp = await _chat(
             llm_client, r_cfg.model, local_msgs,
-            tools=tools, tool_choice="auto",
+            tools=available_tools,
+            tool_choice="auto" if available_tools else None,
             temperature=r_cfg.temperature, max_tokens=r_cfg.max_tokens,
         )
         msg = resp.choices[0].message
@@ -252,7 +257,11 @@ async def _refine_draft(
             args = json.loads(call.function.arguments or "{}")
             result = await dispatch_tool(call.function.name, args, state.evidence)
             new_evs: list[EvidenceItem] = result.get("evidence", []) if isinstance(result, dict) else []
-            state.evidence.extend(new_evs)
+            existing_ids = {item.id for item in state.evidence}
+            for evidence in new_evs:
+                if evidence.id not in existing_ids and len(state.evidence) < evidence_cap:
+                    state.evidence.append(evidence)
+                    existing_ids.add(evidence.id)
             local_msgs.append({
                 "role": "tool",
                 "tool_call_id": call.id,
@@ -260,7 +269,25 @@ async def _refine_draft(
                 "content": json.dumps({"evidence_added": len(new_evs)}, ensure_ascii=False),
             })
 
-    return local_msgs[-1]["content"]
+    local_msgs.append(
+        {
+            "role": "user",
+            "content": (
+                "Tool budget is exhausted or no further retrieval is allowed. "
+                "Provide the best UPDATED DRAFT using the evidence already available."
+            ),
+        }
+    )
+    final_response = await _chat(
+        llm_client,
+        r_cfg.model,
+        local_msgs,
+        tools=None,
+        tool_choice=None,
+        temperature=r_cfg.temperature,
+        max_tokens=r_cfg.max_tokens,
+    )
+    return final_response.choices[0].message.content or current_draft
 
 
 # ---------------------------------------------------------------------------

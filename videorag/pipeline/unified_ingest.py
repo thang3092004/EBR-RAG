@@ -1,0 +1,1002 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import subprocess
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from tqdm import tqdm
+
+from .._entity_anchor.appearance import attach_openclip_embeddings
+from .._entity_anchor.audio import (
+    accepted_speaker_links,
+    assign_speakers_to_words,
+    run_speaker_diarization,
+    run_talknet_adapter,
+)
+from .._entity_anchor.text_entities import TextEntityExtractor
+from .._entity_anchor.tracker_v2 import (
+    build_visual_tracklets,
+    link_visual_tracklets,
+    run_adaptive_deep_tracking,
+    run_chunked_tracking,
+)
+from .._op import get_chunks
+from .._unified_graph.alignment import MiniCPMAligner, align_all_segments
+from .._unified_graph.builder import build_unified_graph, validate_unified_graph
+from .._unified_graph.registry import EntityRegistry, normalize_alias
+from .._videoutil.asr_v2 import (
+    assign_words_to_segments,
+    render_segment_transcript,
+    transcribe_full_video,
+)
+from .._videoutil.frame_selector import run_ocr, select_segment_frames
+from .._videoutil.media_probe import probe_video
+from .._videoutil.modality import profile_modalities
+from .._videoutil.shot_detection import detect_shots_and_motion
+from .._videoutil.smart_segment import smart_segment
+from .._utils import compute_mdhash_id, logger
+from .stage_runner import StageRunner, atomic_write_json, read_json
+from .unified_stages import UNIFIED_STAGE_DEFINITIONS
+
+
+def _scalar_config(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_scalar_config(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _scalar_config(item)
+            for key, item in value.items()
+            if not callable(item)
+        }
+    return str(value)
+
+
+def build_pipeline_config(vrag) -> dict[str, Any]:
+    raw = asdict(vrag) if is_dataclass(vrag) else dict(vars(vrag))
+    excluded = {
+        "llm",
+        "entity_extraction_func",
+        "chunk_func",
+        "convert_response_to_json_func",
+        "key_string_value_json_storage_cls",
+        "vector_db_storage_cls",
+        "vs_vector_db_storage_cls",
+        "graph_storage_cls",
+    }
+    config = {
+        key: _scalar_config(value)
+        for key, value in raw.items()
+        if key not in excluded and not callable(value)
+    }
+    config["caption_backend"] = "MiniCPM-V-2_6-int4"
+    return config
+
+
+def _load_global_registry(working_dir: str | Path) -> EntityRegistry:
+    path = Path(working_dir) / "pipeline_v2" / "global_registry.json"
+    return EntityRegistry(read_json(path, {}))
+
+
+def _new_video_registry(working_dir: str | Path) -> EntityRegistry:
+    global_registry = _load_global_registry(working_dir)
+    return EntityRegistry({"counters": dict(global_registry.counters), "entities": []})
+
+
+def _merge_global_registry(
+    working_dir: str | Path,
+    video_id: str,
+    registry_payload: dict[str, Any],
+) -> list[str]:
+    global_registry = _load_global_registry(working_dir)
+    removed_entity_ids = []
+    for entity_id, node in list(global_registry.entities.items()):
+        belonged_to_video = any(
+            alias.alias_id.startswith(f"{video_id}::")
+            for alias in node.aliases
+        ) or any(
+            item.video_id == video_id
+            for item in node.provenance
+        )
+        node.aliases = [
+            alias
+            for alias in node.aliases
+            if not alias.alias_id.startswith(f"{video_id}::")
+        ]
+        node.provenance = [
+            item for item in node.provenance if item.video_id != video_id
+        ]
+        if belonged_to_video and not node.provenance and not node.aliases:
+            del global_registry.entities[entity_id]
+            removed_entity_ids.append(entity_id)
+    global_registry.alias_to_global = {
+        alias.alias_id: entity_id
+        for entity_id, node in global_registry.entities.items()
+        for alias in node.aliases
+    }
+    global_registry.name_to_global = {
+        normalize_alias(node.canonical_name): entity_id
+        for entity_id, node in global_registry.entities.items()
+    }
+    for entity in registry_payload.get("entities", []):
+        entity_id = entity["entity_id"]
+        global_registry.ensure_entity(
+            entity["entity_type"],
+            entity.get("canonical_name", entity_id),
+            entity_id=entity_id,
+            source=None,
+            confidence=float(entity.get("confidence", 0.0)),
+            attributes=dict(entity.get("attributes", {})),
+        )
+        node = global_registry.entities[entity_id]
+        node.sources = list(entity.get("sources", []))
+        node.first_seen = entity.get("first_seen")
+        node.last_seen = entity.get("last_seen")
+        for alias in entity.get("aliases", []):
+            global_registry.add_alias(
+                f"{video_id}::{alias['alias_id']}",
+                entity_id,
+                source=alias.get("source", "unknown"),
+                label=alias.get("label", ""),
+                confidence=float(alias.get("confidence", 0.0)),
+                segment_id=(
+                    alias.get("segment_ids", [None])[0]
+                    if alias.get("segment_ids")
+                    else None
+                ),
+            )
+        for provenance in entity.get("provenance", []):
+            from .._unified_graph.schema import ProvenanceRecord
+
+            global_registry.add_provenance(
+                entity_id,
+                ProvenanceRecord(**provenance),
+            )
+    for entity_type, count in registry_payload.get("counters", {}).items():
+        global_registry.counters[entity_type] = max(
+            global_registry.counters[entity_type],
+            int(count),
+        )
+    atomic_write_json(
+        Path(working_dir) / "pipeline_v2" / "global_registry.json",
+        global_registry.to_dict(),
+    )
+    return removed_entity_ids
+
+
+def _extract_clip(
+    video_path: str,
+    output_path: Path,
+    start: float,
+    end: float,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_suffix(output_path.suffix + ".tmp.mp4")
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{start:.3f}",
+        "-to",
+        f"{end:.3f}",
+        "-i",
+        video_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        str(temporary),
+    ]
+    subprocess.run(command, check=True)
+    os.replace(temporary, output_path)
+
+
+class UnifiedIngestPipeline:
+    def __init__(
+        self,
+        vrag,
+        *,
+        resume: bool = True,
+        restart_stage: str | None = None,
+        force: bool = False,
+    ):
+        self.vrag = vrag
+        self.config = build_pipeline_config(vrag)
+        self.resume = resume
+        self.restart_stage = restart_stage
+        self.force = force
+        self.loop = asyncio.new_event_loop()
+
+    def _await(self, awaitable):
+        return self.loop.run_until_complete(awaitable)
+
+    def close(self) -> None:
+        self.loop.close()
+
+    def run(self, video_paths: list[str]) -> list[dict[str, Any]]:
+        reports = []
+        try:
+            with tqdm(
+                total=len(video_paths),
+                desc="Unified V2 videos",
+                unit="video",
+                dynamic_ncols=True,
+            ) as video_progress:
+                for video_position, video_path in enumerate(video_paths, start=1):
+                    video_id = Path(video_path).stem
+                    video_progress.set_postfix_str(video_id, refresh=True)
+                    logger.info(
+                        "[Unified V2] Video %d/%d: %s",
+                        video_position,
+                        len(video_paths),
+                        video_id,
+                    )
+                    reports.append(self.run_video(video_path))
+                    video_progress.update(1)
+            return reports
+        finally:
+            self.close()
+
+    def run_video(self, video_path: str) -> dict[str, Any]:
+        video_path = str(Path(video_path).resolve())
+        video_id = Path(video_path).stem
+        input_stat = Path(video_path).stat()
+        run_config = {
+            **self.config,
+            "input_path": video_path,
+            "input_size_bytes": input_stat.st_size,
+            "input_mtime_ns": input_stat.st_mtime_ns,
+        }
+        runner = StageRunner(
+            self.vrag.working_dir,
+            video_id,
+            run_config,
+            UNIFIED_STAGE_DEFINITIONS,
+            resume=self.resume,
+            restart_stage=self.restart_stage,
+            force=self.force,
+        )
+
+        with runner.run_scope():
+            runner.run_stage("probe", lambda context: self._stage_probe(context, video_path))
+            runner.run_stage("asr", lambda context: self._stage_asr(context, runner))
+            runner.run_stage(
+                "shot_detection",
+                lambda context: self._stage_shots(context, runner),
+            )
+            runner.run_stage(
+                "segmentation",
+                lambda context: self._stage_segmentation(context, runner, video_id),
+            )
+            runner.run_stage(
+                "tracking_base",
+                lambda context: self._stage_tracking(context, runner, video_id),
+            )
+            runner.run_stage(
+                "modality_profile",
+                lambda context: self._stage_modality(context, runner),
+            )
+            runner.run_stage(
+                "deep_processing",
+                lambda context: self._stage_deep(context, runner),
+            )
+            runner.run_stage(
+                "speaker_linking",
+                lambda context: self._stage_speakers(context, runner),
+            )
+            runner.run_stage(
+                "text_entities",
+                lambda context: self._stage_text(context, runner),
+            )
+            runner.run_stage(
+                "alignment_caption",
+                lambda context: self._stage_alignment(context, runner, video_id),
+            )
+            runner.run_stage(
+                "graph_build",
+                lambda context: self._stage_graph(context, runner, video_id),
+            )
+            runner.run_stage(
+                "embedding_index",
+                lambda context: self._stage_index(context, runner, video_id),
+            )
+            runner.run_stage(
+                "validation",
+                lambda context: self._stage_validation(context, runner),
+            )
+
+        return read_json(runner.report_path, {})
+
+    def _stage_probe(self, context, video_path: str) -> dict[str, Any]:
+        probe = probe_video(video_path)
+        context.write_json("probe.json", probe)
+        context.report_metrics(**probe)
+        context.log(
+            f"duration={probe['duration']:.2f}s fps={probe['fps']:.3f} "
+            f"resolution={probe['width']}x{probe['height']}"
+        )
+        return {"output": str(context.path("probe.json")), **probe}
+
+    def _stage_asr(self, context, runner: StageRunner) -> dict[str, Any]:
+        probe = read_json(runner.output("probe", "probe.json"))
+        with context.progress(
+            total=float(probe["duration"]),
+            unit="s",
+            description="ASR full video",
+        ) as progress:
+            if probe.get("has_audio") is False:
+                result = {
+                    "model": "none",
+                    "device": "none",
+                    "compute_type": "none",
+                    "language": None,
+                    "language_probability": 0.0,
+                    "duration": float(probe["duration"]),
+                    "vad_filter": False,
+                    "words": [],
+                    "utterances": [],
+                    "reason": "no_audio_stream",
+                }
+                progress.set(float(probe["duration"]), reason="no_audio_stream")
+            else:
+                result = transcribe_full_video(
+                    probe["path"],
+                    self.config,
+                    progress=progress,
+                )
+        context.write_json("asr.json", result)
+        context.report_metrics(
+            words=len(result["words"]),
+            utterances=len(result["utterances"]),
+            model=result["model"],
+            device=result["device"],
+        )
+        return {
+            "output": str(context.path("asr.json")),
+            "words": len(result["words"]),
+            "utterances": len(result["utterances"]),
+            "model": result["model"],
+        }
+
+    def _stage_shots(self, context, runner: StageRunner) -> dict[str, Any]:
+        probe = read_json(runner.output("probe", "probe.json"))
+        with context.progress(
+            total=float(probe["duration"]),
+            unit="s",
+            description="Shot and motion analysis",
+        ) as progress:
+            result = detect_shots_and_motion(
+                probe["path"],
+                float(probe["duration"]),
+                self.config,
+                progress=progress,
+            )
+        context.write_json("shots.json", result)
+        context.report_metrics(
+            backend=result["backend"],
+            shots=len(result["boundaries"]),
+            samples=len(result["samples"]),
+        )
+        return {
+            "output": str(context.path("shots.json")),
+            "backend": result["backend"],
+            "shots": len(result["boundaries"]),
+        }
+
+    def _stage_segmentation(
+        self,
+        context,
+        runner: StageRunner,
+        video_id: str,
+    ) -> dict[str, Any]:
+        probe = read_json(runner.output("probe", "probe.json"))
+        asr = read_json(runner.output("asr", "asr.json"))
+        shots = read_json(runner.output("shot_detection", "shots.json"))
+        segments = smart_segment(
+            float(probe["duration"]),
+            asr["words"],
+            shots["boundaries"],
+            self.config,
+        )
+        for segment in segments:
+            segment["storage_id"] = f"{video_id}_{segment['index']}"
+        context.write_json("segments.json", segments)
+        durations = [float(item["duration"]) for item in segments]
+        context.report_metrics(
+            segments=len(segments),
+            min_duration=min(durations, default=0.0),
+            max_duration=max(durations, default=0.0),
+            mean_duration=float(np.mean(durations)) if durations else 0.0,
+        )
+        return {
+            "output": str(context.path("segments.json")),
+            "segments": len(segments),
+        }
+
+    def _stage_tracking(
+        self,
+        context,
+        runner: StageRunner,
+        video_id: str,
+    ) -> dict[str, Any]:
+        probe = read_json(runner.output("probe", "probe.json"))
+        segments = read_json(runner.output("segmentation", "segments.json"))
+        with context.progress(
+            total=float(probe["duration"]),
+            unit="s",
+            description="YOLO + BoT-SORT base tracking",
+        ) as progress:
+            observations = run_chunked_tracking(
+                probe["path"],
+                probe,
+                segments,
+                self.config,
+                context.path("chunks"),
+                progress=progress,
+            )
+        tracklets = build_visual_tracklets(observations)
+        embedding_report = attach_openclip_embeddings(tracklets, self.config)
+        registry = _new_video_registry(self.vrag.working_dir)
+        visual_entities = link_visual_tracklets(
+            tracklets,
+            registry,
+            video_id,
+            self.config,
+        )
+        context.write_json("observations.json", observations)
+        context.write_json("tracklets.json", tracklets)
+        context.write_json("visual_entities.json", visual_entities)
+        context.write_json("registry.json", registry.to_dict())
+        context.write_json("appearance_report.json", embedding_report)
+        context.report_metrics(
+            observations=len(observations),
+            tracklets=len(tracklets),
+            visual_entities=len(visual_entities),
+            appearance_backend=(
+                embedding_report.get("model")
+                if embedding_report.get("available")
+                else embedding_report.get("reason")
+            ),
+        )
+        return {
+            "observations": len(observations),
+            "tracklets": len(tracklets),
+            "visual_entities": len(visual_entities),
+            "appearance": embedding_report,
+        }
+
+    def _stage_modality(self, context, runner: StageRunner) -> dict[str, Any]:
+        segments = read_json(runner.output("segmentation", "segments.json"))
+        asr = read_json(runner.output("asr", "asr.json"))
+        shots = read_json(runner.output("shot_detection", "shots.json"))
+        observations = read_json(
+            runner.output("tracking_base", "observations.json"),
+            [],
+        )
+        profiles = profile_modalities(
+            segments,
+            asr["words"],
+            shots,
+            observations,
+            self.config,
+        )
+        context.write_json("profiles.json", profiles)
+        counts: dict[str, int] = {}
+        for profile in profiles:
+            counts[profile["mode"]] = counts.get(profile["mode"], 0) + 1
+        context.report_metrics(**counts)
+        return {"output": str(context.path("profiles.json")), "counts": counts}
+
+    def _stage_deep(self, context, runner: StageRunner) -> dict[str, Any]:
+        probe = read_json(runner.output("probe", "probe.json"))
+        segments = read_json(runner.output("segmentation", "segments.json"))
+        shots = read_json(runner.output("shot_detection", "shots.json"))
+        profiles = read_json(runner.output("modality_profile", "profiles.json"))
+        observations = read_json(
+            runner.output("tracking_base", "observations.json"),
+            [],
+        )
+        registry = EntityRegistry(
+            read_json(runner.output("tracking_base", "registry.json"))
+        )
+        observations, deep_tracking_report = run_adaptive_deep_tracking(
+            probe["path"],
+            probe,
+            segments,
+            profiles,
+            observations,
+            registry,
+            Path(probe["path"]).stem,
+            self.config,
+            context.path("deep_tracking"),
+        )
+        context.write_json("observations.json", observations)
+        context.write_json("registry.json", registry.to_dict())
+        context.write_json("deep_tracking_report.json", deep_tracking_report)
+        profile_map = {item["segment_id"]: item for item in profiles}
+        selections: dict[str, dict[str, Any]] = {}
+        with context.progress(
+            total=len(segments),
+            unit="seg",
+            description="Adaptive frame/OCR processing",
+        ) as progress:
+            for index, segment in enumerate(segments):
+                segment_id = segment["segment_id"]
+                result_path = context.path(f"segments/{segment_id}.json")
+                existing = read_json(result_path)
+                if existing:
+                    selections[segment_id] = existing
+                    progress.set(index + 1, resumed=True)
+                    continue
+                selection = select_segment_frames(
+                    probe["path"],
+                    segment,
+                    profile_map[segment_id],
+                    shots,
+                    observations,
+                    context.path("frames"),
+                    self.config,
+                )
+                if profile_map[segment_id]["mode"] in {"visual_rich", "balanced"}:
+                    selection["ocr"] = run_ocr(
+                        selection.get("frames", []),
+                        self.config,
+                    )
+                else:
+                    selection["ocr"] = {
+                        "available": False,
+                        "reason": "speech_rich_budget",
+                        "items": [],
+                    }
+                atomic_write_json(result_path, selection)
+                selections[segment_id] = selection
+                progress.set(
+                    index + 1,
+                    mode=profile_map[segment_id]["mode"],
+                    frames=len(selection.get("frames", [])),
+                )
+        context.write_json("frame_selections.json", selections)
+        context.report_metrics(
+            selected_frames=sum(
+                len(item.get("frames", [])) for item in selections.values()
+            ),
+            ocr_segments=sum(
+                1
+                for item in selections.values()
+                if item.get("ocr", {}).get("available")
+            ),
+            deep_tracking_segments=deep_tracking_report.get("deep_segments", 0),
+            deep_tracking_observations=deep_tracking_report.get(
+                "new_observations", 0
+            ),
+        )
+        return {
+            "segments": len(selections),
+            "selected_frames": sum(
+                len(item.get("frames", [])) for item in selections.values()
+            ),
+            "deep_tracking": deep_tracking_report,
+        }
+
+    def _stage_speakers(self, context, runner: StageRunner) -> dict[str, Any]:
+        probe = read_json(runner.output("probe", "probe.json"))
+        asr = read_json(runner.output("asr", "asr.json"))
+        with context.progress(
+            total=float(probe["duration"]),
+            unit="s",
+            description="Speaker diarization",
+        ) as progress:
+            if probe.get("has_audio") is False:
+                diarization = {
+                    "available": False,
+                    "reason": "no_audio_stream",
+                    "turns": [],
+                }
+                progress.set(float(probe["duration"]), reason="no_audio_stream")
+            else:
+                diarization = run_speaker_diarization(
+                    probe["path"],
+                    self.config,
+                    progress=progress,
+                )
+        words = assign_speakers_to_words(asr["words"], diarization.get("turns", []))
+        talknet_output = context.path("talknet.json")
+        talknet = run_talknet_adapter(
+            probe["path"],
+            str(runner.output("deep_processing", "observations.json")),
+            str(talknet_output),
+            self.config,
+        )
+        accepted = accepted_speaker_links(talknet, self.config)
+        result = {
+            "diarization": diarization,
+            "talknet": talknet,
+            "accepted_links": accepted,
+            "words": words,
+        }
+        context.write_json("speakers.json", result)
+        context.report_metrics(
+            diarization_available=diarization.get("available", False),
+            speakers=diarization.get("speaker_count", 0),
+            talknet_available=talknet.get("available", False),
+            accepted_links=len(accepted),
+        )
+        return {
+            "output": str(context.path("speakers.json")),
+            "speakers": diarization.get("speaker_count", 0),
+            "accepted_links": len(accepted),
+        }
+
+    def _stage_text(self, context, runner: StageRunner) -> dict[str, Any]:
+        segments = read_json(runner.output("segmentation", "segments.json"))
+        speaker_result = read_json(
+            runner.output("speaker_linking", "speakers.json")
+        )
+        by_segment = assign_words_to_segments(
+            speaker_result["words"],
+            segments,
+        )
+        extractor = TextEntityExtractor(self.config)
+        results = {}
+        with context.progress(
+            total=len(segments),
+            unit="seg",
+            description="Transcript entity and claim extraction",
+        ) as progress:
+            for index, segment in enumerate(segments):
+                segment_id = segment["segment_id"]
+                result = extractor.extract_segment(
+                    segment,
+                    by_segment.get(segment_id, []),
+                )
+                results[segment_id] = result
+                progress.set(
+                    index + 1,
+                    entities=sum(len(item["mentions"]) for item in results.values()),
+                    claims=sum(len(item["claims"]) for item in results.values()),
+                )
+        context.write_json("text_entities.json", results)
+        context.report_metrics(
+            backend=extractor.backend,
+            mentions=sum(len(item["mentions"]) for item in results.values()),
+            claims=sum(len(item["claims"]) for item in results.values()),
+        )
+        return {
+            "output": str(context.path("text_entities.json")),
+            "backend": extractor.backend,
+        }
+
+    def _stage_alignment(
+        self,
+        context,
+        runner: StageRunner,
+        video_id: str,
+    ) -> dict[str, Any]:
+        segments = read_json(runner.output("segmentation", "segments.json"))
+        profiles = read_json(runner.output("modality_profile", "profiles.json"))
+        selections = read_json(
+            runner.output("deep_processing", "frame_selections.json")
+        )
+        text_results = read_json(
+            runner.output("text_entities", "text_entities.json")
+        )
+        observations = read_json(
+            runner.output("deep_processing", "observations.json")
+        )
+        speakers = read_json(
+            runner.output("speaker_linking", "speakers.json")
+        )
+        registry = EntityRegistry(
+            read_json(runner.output("deep_processing", "registry.json"))
+        )
+        aligner = MiniCPMAligner(
+            self.config,
+            model=getattr(self.vrag, "caption_model", None),
+            tokenizer=getattr(self.vrag, "caption_tokenizer", None),
+        )
+        with context.progress(
+            total=len(segments),
+            unit="seg",
+            description="MiniCPM caption and cross-modal alignment",
+        ) as progress:
+            try:
+                result = align_all_segments(
+                    video_id,
+                    segments,
+                    profiles,
+                    selections,
+                    text_results,
+                    observations,
+                    speakers.get("accepted_links", []),
+                    registry,
+                    self.config,
+                    context.path("segments"),
+                    progress=progress,
+                    aligner=aligner,
+                )
+            finally:
+                aligner.close()
+        context.write_json("alignment.json", result)
+        stale_entity_ids = _merge_global_registry(
+            self.vrag.working_dir,
+            video_id,
+            result["registry"],
+        )
+        result["stale_entity_ids"] = stale_entity_ids
+        context.write_json("alignment.json", result)
+        context.report_metrics(
+            entities=len(result["registry"]["entities"]),
+            edges=result["edge_count"],
+            model="MiniCPM-V-2_6-int4",
+            stale_entities=len(stale_entity_ids),
+        )
+        return {
+            "output": str(context.path("alignment.json")),
+            "entities": len(result["registry"]["entities"]),
+            "edges": result["edge_count"],
+            "model": "MiniCPM-V-2_6-int4",
+        }
+
+    def _segment_storage_payload(
+        self,
+        runner: StageRunner,
+        video_id: str,
+    ) -> dict[str, dict[str, Any]]:
+        segments = read_json(runner.output("segmentation", "segments.json"))
+        alignment = read_json(
+            runner.output("alignment_caption", "alignment.json")
+        )
+        profiles = read_json(runner.output("modality_profile", "profiles.json"))
+        selections = read_json(
+            runner.output("deep_processing", "frame_selections.json")
+        )
+        profile_map = {item["segment_id"]: item for item in profiles}
+        payload = {}
+        for segment in segments:
+            segment_id = segment["segment_id"]
+            aligned = alignment["segments"][segment_id]
+            visible_ids = sorted(
+                {
+                    node
+                    for edge in aligned.get("edges", [])
+                    for node in (edge["source_id"], edge["target_id"])
+                }
+            )
+            entity_memory = (
+                "Entity Memory:\n"
+                + "\n".join(f"- {entity_id}" for entity_id in visible_ids)
+                if visible_ids
+                else ""
+            )
+            caption = aligned.get("caption", "")
+            transcript = aligned.get("rewritten_transcript", "")
+            content = (
+                f"{entity_memory}\nCaption:\n{caption}\n"
+                f"Transcript:\n{transcript}\n"
+            ).strip()
+            payload[str(segment["index"])] = {
+                "content": content,
+                "time": f"{segment['start']:.3f}-{segment['end']:.3f}",
+                "transcript": transcript,
+                "caption": caption,
+                "entity_memory": entity_memory,
+                "frame_times": [
+                    frame["time"]
+                    for frame in selections.get(segment_id, {}).get("frames", [])
+                ],
+                "segment_id": segment_id,
+                "storage_id": segment["storage_id"],
+                "modality_profile": profile_map[segment_id],
+            }
+        return payload
+
+    def _stage_graph(
+        self,
+        context,
+        runner: StageRunner,
+        video_id: str,
+    ) -> dict[str, Any]:
+        alignment = read_json(
+            runner.output("alignment_caption", "alignment.json")
+        )
+        removal_stats = {"removed_edges": 0, "removed_nodes": 0}
+        if hasattr(self.vrag.chunk_entity_relation_graph, "remove_video"):
+            removal_stats = self._await(
+                self.vrag.chunk_entity_relation_graph.remove_video(video_id)
+            )
+        graph_stats = self._await(
+            build_unified_graph(
+                self.vrag.chunk_entity_relation_graph,
+                alignment["registry"],
+                alignment["segments"],
+                clear=False,
+            )
+        )
+        segment_payload = self._segment_storage_payload(runner, video_id)
+        self._await(self.vrag.video_path_db.upsert({video_id: read_json(
+            runner.output("probe", "probe.json")
+        )["path"]}))
+        self._await(self.vrag.video_segments.upsert({video_id: segment_payload}))
+        self._await(self.vrag.video_segments.index_done_callback())
+        self._await(self.vrag.video_path_db.index_done_callback())
+        self._await(self.vrag.chunk_entity_relation_graph.index_done_callback())
+        context.write_json("graph_stats.json", graph_stats)
+        context.report_metrics(**graph_stats, **removal_stats)
+        return {**graph_stats, **removal_stats}
+
+    def _stage_index(
+        self,
+        context,
+        runner: StageRunner,
+        video_id: str,
+    ) -> dict[str, Any]:
+        probe = read_json(runner.output("probe", "probe.json"))
+        segments = read_json(runner.output("segmentation", "segments.json"))
+        segment_payload = self._segment_storage_payload(runner, video_id)
+        old_video_data = getattr(self.vrag.video_segments, "_data", {}).get(
+            video_id,
+            {},
+        )
+        old_visual_ids = [
+            f"{video_id}_{segment_index}"
+            for segment_index in old_video_data
+        ]
+        if old_visual_ids and hasattr(
+            getattr(self.vrag.video_segment_feature_vdb, "_client", None),
+            "delete",
+        ):
+            self.vrag.video_segment_feature_vdb._client.delete(old_visual_ids)
+
+        old_chunk_ids = []
+        for chunk_id, chunk in list(
+            getattr(self.vrag.text_chunks, "_data", {}).items()
+        ):
+            segment_ids = chunk.get("video_segment_id", [])
+            if any(
+                str(segment_id).startswith(f"{video_id}_")
+                for segment_id in segment_ids
+            ):
+                old_chunk_ids.append(chunk_id)
+                del self.vrag.text_chunks._data[chunk_id]
+        if old_chunk_ids and hasattr(
+            getattr(self.vrag.chunks_vdb, "_client", None),
+            "delete",
+        ):
+            self.vrag.chunks_vdb._client.delete(old_chunk_ids)
+        cache_dir = (
+            Path(self.vrag.working_dir)
+            / "_cache"
+            / video_id
+        )
+        segment_index2name = {}
+        with context.progress(
+            total=len(segments),
+            unit="seg",
+            description="Segment clips and embedding indexes",
+        ) as progress:
+            for index, segment in enumerate(segments):
+                name = (
+                    f"stable-{segment['index']}-"
+                    f"{segment['start']:.3f}-{segment['end']:.3f}"
+                )
+                segment_index2name[str(segment["index"])] = name
+                clip_path = cache_dir / f"{name}.{self.vrag.video_output_format}"
+                if not clip_path.exists():
+                    _extract_clip(
+                        probe["path"],
+                        clip_path,
+                        float(segment["start"]),
+                        float(segment["end"]),
+                    )
+                progress.set(index + 1, clips=index + 1)
+
+        chunks = get_chunks(
+            new_videos={video_id: segment_payload},
+            chunk_func=self.vrag.chunk_func,
+            max_token_size=self.vrag.chunk_token_size,
+        )
+        new_chunk_ids = self._await(
+            self.vrag.text_chunks.filter_keys(list(chunks.keys()))
+        )
+        new_chunks = {
+            key: value for key, value in chunks.items() if key in new_chunk_ids
+        }
+        if new_chunks:
+            if self.vrag.chunks_vdb is not None:
+                self._await(self.vrag.chunks_vdb.upsert(new_chunks))
+            self._await(self.vrag.text_chunks.upsert(new_chunks))
+
+        alignment = read_json(
+            runner.output("alignment_caption", "alignment.json")
+        )
+        stale_entity_vdb_ids = [
+            compute_mdhash_id(entity_id, prefix="ent-")
+            for entity_id in alignment.get("stale_entity_ids", [])
+        ]
+        if stale_entity_vdb_ids and hasattr(
+            getattr(self.vrag.entities_vdb, "_client", None),
+            "delete",
+        ):
+            self.vrag.entities_vdb._client.delete(stale_entity_vdb_ids)
+        entity_data = {}
+        for entity in alignment["registry"]["entities"]:
+            aliases = " ".join(
+                alias.get("label", "") for alias in entity.get("aliases", [])
+            )
+            content = (
+                f"{entity['entity_id']} {entity.get('canonical_name', '')} "
+                f"{entity.get('entity_type', '')} {aliases}"
+            )
+            entity_data[compute_mdhash_id(entity["entity_id"], prefix="ent-")] = {
+                "content": content,
+                "entity_name": entity["entity_id"],
+            }
+        if self.vrag.entities_vdb is not None and entity_data:
+            self._await(self.vrag.entities_vdb.upsert(entity_data))
+
+        self._await(
+            self.vrag.video_segment_feature_vdb.upsert(
+                video_id,
+                segment_index2name,
+                self.vrag.video_output_format,
+            )
+        )
+        self._await(self.vrag._insert_done())
+        context.report_metrics(
+            chunks=len(chunks),
+            new_chunks=len(new_chunks),
+            indexed_entities=len(entity_data),
+            visual_segments=len(segments),
+        )
+        if cache_dir.exists() and not self.config.get("keep_segment_cache", False):
+            shutil.rmtree(cache_dir)
+        return {
+            "chunks": len(chunks),
+            "new_chunks": len(new_chunks),
+            "entities": len(entity_data),
+            "visual_segments": len(segments),
+        }
+
+    def _stage_validation(self, context, runner: StageRunner) -> dict[str, Any]:
+        graph_report = self._await(
+            validate_unified_graph(self.vrag.chunk_entity_relation_graph)
+        )
+        segments = read_json(runner.output("segmentation", "segments.json"))
+        alignment = read_json(
+            runner.output("alignment_caption", "alignment.json")
+        )
+        missing_segments = [
+            segment["segment_id"]
+            for segment in segments
+            if segment["segment_id"] not in alignment["segments"]
+        ]
+        report = {
+            **graph_report,
+            "missing_aligned_segments": missing_segments,
+            "valid": graph_report["valid"] and not missing_segments,
+        }
+        context.write_json("validation_report.json", report)
+        context.report_metrics(**report)
+        if not report["valid"]:
+            raise RuntimeError(
+                "Unified graph validation failed. See validation_report.json."
+            )
+        return report

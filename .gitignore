@@ -41,6 +41,7 @@ judge_output.json
 *.md
 !README.md
 !ENTITY_ANCHORED_TM_GRAPH_PLAN.md
+!SERVER_UNIFIED_V2.md
 !papers/
 !papers/**/*.md
 !Papers/
@@ -51,6 +52,21 @@ judge_output.json
 *ablation*.json
 push_hf.py
 demo.py
+ingest_test_video.py
+run_ingest.py
+
+# --- LaTeX Temp Files ---
+*.aux
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# --- Server Data Directories ---
+/data/
+/videos/
+/workdirs/
 
 # --- Archives ---
 *.zip

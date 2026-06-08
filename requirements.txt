@@ -20,7 +20,8 @@ fvcore
 iopath
 matplotlib
 types-regex
-transformers==4.37.1
+transformers==4.40.0
+sentencepiece==0.1.99
 ultralytics
 
 # Video & Audio Processing
