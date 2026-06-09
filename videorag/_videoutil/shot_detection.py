@@ -32,7 +32,6 @@ def _opencv_shots(
     frame_index = 0
     previous_histogram = None
     previous_gray = None
-    previous_edge_density = None
     boundaries: list[dict[str, float]] = []
     samples: list[dict[str, float]] = []
     while True:
@@ -45,8 +44,6 @@ def _opencv_shots(
         timestamp = frame_index / max(source_fps, 1e-6)
         histogram = _histogram(frame, cv2)
         gray = cv2.cvtColor(cv2.resize(frame, (160, 90)), cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 80, 160)
-        edge_density = float(np.mean(edges > 0))
         shot_score = 0.0
         motion_score = 0.0
         if previous_histogram is not None:
@@ -62,25 +59,17 @@ def _opencv_shots(
                 np.mean(cv2.absdiff(previous_gray, gray)) / 255.0
             )
         blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        text_change_score = (
-            abs(edge_density - previous_edge_density)
-            if previous_edge_density is not None
-            else 0.0
-        )
         sample = {
             "time": timestamp,
             "shot_score": shot_score,
             "motion_score": motion_score,
             "blur_score": blur_score,
-            "edge_density": edge_density,
-            "text_change_score": text_change_score,
         }
         samples.append(sample)
         if shot_score >= threshold:
             boundaries.append({"time": timestamp, "score": min(shot_score, 1.0)})
         previous_histogram = histogram
         previous_gray = gray
-        previous_edge_density = edge_density
         frame_index += 1
         if progress is not None:
             progress.set(min(timestamp, duration), shots=len(boundaries))

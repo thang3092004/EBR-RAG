@@ -1,6 +1,12 @@
 from pathlib import Path
 
-from videorag.pipeline.stage_runner import StageDefinition, StageRunner
+from videorag.pipeline.stage_runner import (
+    PIPELINE_VERSION,
+    StageDefinition,
+    StageRunner,
+    atomic_write_json,
+)
+from videorag.pipeline.unified_stages import UNIFIED_STAGE_DEFINITIONS
 
 
 def _stages():
@@ -70,3 +76,65 @@ def test_input_fingerprint_invalidates_probe_and_descendants(tmp_path):
         changed.run_stage("next", lambda context: calls.append("next"))
 
     assert calls == ["probe", "next"]
+
+
+def test_unified_stage_graph_is_entity_only():
+    stage_names = {
+        definition.name for definition in UNIFIED_STAGE_DEFINITIONS
+    }
+
+    assert "frame_selection" in stage_names
+    assert "text_entities" in stage_names
+    assert "alignment_caption" in stage_names
+    assert "modality_profile" not in stage_names
+    assert "deep_processing" not in stage_names
+    assert "speaker_linking" not in stage_names
+
+
+def test_ablation_flags_are_part_of_stage_fingerprints():
+    by_name = {
+        definition.name: definition
+        for definition in UNIFIED_STAGE_DEFINITIONS
+    }
+
+    assert "segmentation_strategy" in by_name["segmentation"].config_keys
+    assert (
+        "disable_visual_identity_linking"
+        in by_name["tracking_base"].config_keys
+    )
+    assert (
+        "disable_transcript_memory"
+        in by_name["text_entities"].config_keys
+    )
+    assert (
+        "disable_crossmodal_alignment"
+        in by_name["alignment_caption"].config_keys
+    )
+
+
+def test_version_migration_removes_obsolete_stage_outputs(tmp_path):
+    video_dir = tmp_path / "pipeline_v2" / "video"
+    for stage_name in (
+        "modality_profile",
+        "deep_processing",
+        "speaker_linking",
+    ):
+        stage_dir = video_dir / stage_name
+        stage_dir.mkdir(parents=True)
+        (stage_dir / "artifact.json").write_text("{}", encoding="utf-8")
+    atomic_write_json(
+        video_dir / "manifest.json",
+        {
+            "pipeline_version": "unified-graph-v2",
+            "video_id": "video",
+            "stages": {},
+        },
+    )
+
+    runner = StageRunner(tmp_path, "video", {}, _stages())
+
+    assert runner.manifest["pipeline_version"] == PIPELINE_VERSION
+    assert not (video_dir / "modality_profile").exists()
+    assert not (video_dir / "deep_processing").exists()
+    assert not (video_dir / "speaker_linking").exists()
+    runner.close()

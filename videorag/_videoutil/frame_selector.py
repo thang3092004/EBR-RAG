@@ -109,7 +109,6 @@ def _draw_overlay(frame, time_s: float, observations: list[dict[str, Any]], cv2)
 def select_segment_frames(
     video_path: str,
     segment: dict[str, Any],
-    profile: dict[str, Any],
     shot_data: dict[str, Any],
     observations: list[dict[str, Any]],
     output_dir: str | Path,
@@ -149,13 +148,7 @@ def select_segment_frames(
         filtered = sorted(candidates, key=lambda item: item["quality"], reverse=True)[:2]
 
     minimum = int(config.get("frame_min", 2))
-    mode_max = {
-        "visual_rich": int(config.get("frame_max", 6)),
-        "balanced": min(4, int(config.get("frame_max", 6))),
-        "speech_rich": max(2, min(3, int(config.get("frame_max", 6)))),
-        "low_information": 2,
-    }
-    maximum = max(minimum, mode_max.get(profile.get("mode"), 4))
+    maximum = max(minimum, int(config.get("frame_max", 6)))
     duplicate_threshold = float(config.get("frame_duplicate_threshold", 0.94))
     gain_threshold = float(config.get("frame_marginal_gain_threshold", 0.05))
     all_entities = set().union(*(item["entities"] for item in filtered))
@@ -243,33 +236,3 @@ def select_segment_frames(
         "blur_cutoff": blur_cutoff,
         "covered_entities": sorted(covered_entities),
     }
-
-
-def run_ocr(
-    frame_records: list[dict[str, Any]],
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    if not config.get("enable_ocr", True):
-        return {"available": False, "reason": "disabled", "items": []}
-    try:
-        from paddleocr import PaddleOCR
-    except ImportError:
-        return {
-            "available": False,
-            "reason": "paddleocr_not_installed",
-            "items": [],
-        }
-
-    ocr = PaddleOCR(use_angle_cls=True, lang=str(config.get("ocr_language", "en")))
-    items = []
-    for frame in frame_records:
-        result = ocr.ocr(frame["path"], cls=True)
-        texts = []
-        for page in result or []:
-            for line in page or []:
-                if len(line) < 2:
-                    continue
-                text, confidence = line[1]
-                texts.append({"text": str(text), "confidence": float(confidence)})
-        items.append({"time": frame["time"], "texts": texts})
-    return {"available": True, "backend": "PaddleOCR", "items": items}

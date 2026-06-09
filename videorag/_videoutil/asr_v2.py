@@ -127,34 +127,3 @@ def assign_words_to_segments(
         if float(segment["start"]) <= midpoint <= float(segment["end"]):
             assigned[str(segment["segment_id"])].append(word)
     return dict(assigned)
-
-
-def render_segment_transcript(words: list[dict[str, Any]]) -> str:
-    if not words:
-        return ""
-    lines: list[str] = []
-    current_speaker = None
-    current_words: list[str] = []
-    current_start = 0.0
-    current_end = 0.0
-    for word in words:
-        speaker = word.get("speaker_id") or "SPEAKER_UNKNOWN"
-        if current_speaker is None:
-            current_speaker = speaker
-            current_start = float(word["start"])
-        if speaker != current_speaker:
-            lines.append(
-                f"[{current_start:.2f}s -> {current_end:.2f}s] "
-                f"{current_speaker}: {' '.join(current_words)}"
-            )
-            current_words = []
-            current_speaker = speaker
-            current_start = float(word["start"])
-        current_words.append(str(word["text"]))
-        current_end = float(word["end"])
-    if current_words:
-        lines.append(
-            f"[{current_start:.2f}s -> {current_end:.2f}s] "
-            f"{current_speaker}: {' '.join(current_words)}"
-        )
-    return "\n".join(lines)

@@ -171,20 +171,27 @@ async def _run_critique(
     cfg: DebateConfig,
     role_cfgs: dict = ROLE_CONFIGS,
     is_mcq: bool = False,
+    evidence: List[EvidenceItem] | None = None,
 ) -> str:
-    """Blinded Critique: Attacks the latest draft based on logic and history."""
+    """Attack the latest draft, blinded unless the ablation flag exposes evidence."""
     r_cfg: RoleConfig = role_cfgs.get("critique", RoleConfig(model=cfg.model))
     
     # We pass the history so the critique knows what was already addressed
     history_str = json.dumps(_compact_transcript(debate_history, limit=10), ensure_ascii=False)
     prompt_base = agents_prompts.CRITIQUE_PROMPT_MCQ if is_mcq else agents_prompts.CRITIQUE_PROMPT_OPEN
     
+    evidence_section = ""
+    if cfg.critique_see_evidence:
+        evidence_section = (
+            f"\n\nEvidence Pool:\n{_format_evidence(evidence or [])}"
+        )
     local_msgs = [
         {"role": "system", "content": prompt_base},
         {"role": "user", "content": (
             f"Query: {query}\n\n"
             f"Current Draft/Analysis:\n{current_draft}\n\n"
-            f"Refinement History (last 10 messages):\n{history_str}\n\n"
+            f"Refinement History (last 10 messages):\n{history_str}"
+            f"{evidence_section}\n\n"
             "Analyze the draft for flaws, gaps, or hallucinations. Provide your list of flaws."
         )},
     ]
@@ -385,7 +392,14 @@ async def run_debate(
 
         # 1. Critique attacks the current draft
         critique_feedback = await _run_critique(
-            query, current_draft, state.transcript, llm_client, cfg, role_cfgs, is_mcq
+            query,
+            current_draft,
+            state.transcript,
+            llm_client,
+            cfg,
+            role_cfgs,
+            is_mcq,
+            state.evidence,
         )
         state.transcript.append({
             "role": "assistant",

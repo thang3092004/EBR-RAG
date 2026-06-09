@@ -28,6 +28,16 @@ def _videos(args) -> list[str]:
     missing = [path for path in unique if not Path(path).is_file()]
     if missing:
         raise FileNotFoundError("Missing video files:\n" + "\n".join(missing))
+    by_video_id = {}
+    for path in unique:
+        video_id = Path(path).stem
+        previous = by_video_id.get(video_id)
+        if previous and previous != path:
+            raise ValueError(
+                "Video filename collision: both paths map to workspace ID "
+                f"{video_id!r}:\n{previous}\n{path}"
+            )
+        by_video_id[video_id] = path
     return unique
 
 
@@ -58,20 +68,28 @@ def main() -> None:
     parser.add_argument("--no-resume", action="store_true", help="Ignore completed stages.")
     parser.add_argument("--restart-stage", help="Re-run this stage and all downstream stages.")
     parser.add_argument("--force", action="store_true", help="Re-run every stage for each video.")
-    parser.add_argument("--disable-ocr", action="store_true")
-    parser.add_argument("--disable-diarization", action="store_true")
-    parser.add_argument("--enable-talknet", action="store_true")
     parser.add_argument(
-        "--talknet-command",
-        default="",
-        help="Command template with {video}, {tracks}, and {output} placeholders.",
+        "--continue-on-error",
+        action="store_true",
+        help="Record a failed video and continue with the remaining collection.",
     )
     parser.add_argument("--asr-model", default="Systran/faster-distil-whisper-large-v3")
     parser.add_argument("--tracking-model", default="yolov8n.pt")
     parser.add_argument("--tracking-fps", type=float, default=3.0)
-    parser.add_argument("--deep-tracking-fps", type=float, default=6.0)
     parser.add_argument("--caption-model", default="./MiniCPM-V-2_6-int4")
     parser.add_argument("--spacy-model", default="en_core_web_trf")
+    parser.add_argument(
+        "--profile",
+        default="full_framework",
+        choices=(
+            "full_framework",
+            "no_adaptive_segmentation",
+            "no_transcript_memory",
+            "no_visual_identity_linking",
+            "no_crossmodal_alignment",
+        ),
+        help="Controlled ingestion ablation profile.",
+    )
     parser.add_argument("--keep-segment-cache", action="store_true")
     args = parser.parse_args()
 
@@ -80,15 +98,21 @@ def main() -> None:
         parser.error("Provide at least one --video or --video-dir.")
 
     from videorag._llm import openai_config
+    from videorag.ablation import ingestion_profile_overrides
+    from videorag.pipeline.stage_runner import PIPELINE_VERSION
     from videorag.videorag import VideoRAG
 
+    profile_overrides = ingestion_profile_overrides(args.profile)
+
     settings = {
-        "pipeline": "unified-graph-v2",
+        "pipeline": PIPELINE_VERSION,
         "workdir": str(Path(args.workdir).resolve()),
         "videos": videos,
         "resume": not args.no_resume,
+        "profile": args.profile,
         "restart_stage": args.restart_stage,
         "force": args.force,
+        "continue_on_error": args.continue_on_error,
         "models": {
             "caption_alignment": "MiniCPM-V-2_6-int4",
             "caption_model_path": args.caption_model,
@@ -96,12 +120,7 @@ def main() -> None:
             "tracking": args.tracking_model,
             "tracker": "BoT-SORT",
             "appearance": "OpenCLIP ViT-B-32",
-            "diarization": (
-                "disabled"
-                if args.disable_diarization
-                else "pyannote/speaker-diarization-3.1"
-            ),
-            "active_speaker": "TalkNet" if args.enable_talknet else "disabled",
+            "correspondence": "OpenCLIP ViT-B-32 text encoder",
             "text_entities": args.spacy_model,
             "visual_retrieval": "ImageBind-Huge",
         },
@@ -118,14 +137,11 @@ def main() -> None:
         asr_model=args.asr_model,
         entity_tracking_model=args.tracking_model,
         entity_tracking_fps=args.tracking_fps,
-        entity_tracking_deep_fps=args.deep_tracking_fps,
         caption_model_path=args.caption_model,
         spacy_model=args.spacy_model,
-        enable_ocr=not args.disable_ocr,
-        enable_diarization=not args.disable_diarization,
-        enable_talknet=args.enable_talknet,
-        talknet_command=args.talknet_command,
         keep_segment_cache=args.keep_segment_cache,
+        pipeline_continue_on_error=args.continue_on_error,
+        **profile_overrides,
     )
     reports = vrag.insert_video(
         videos,
@@ -133,9 +149,22 @@ def main() -> None:
         restart_stage=args.restart_stage,
         force=args.force,
     )
-    print(json.dumps({"status": "complete", "reports": reports}, ensure_ascii=False, indent=2))
+    failed = [
+        report
+        for report in reports
+        if report.get("status") not in {"complete", "completed"}
+    ]
+    status = "complete" if not failed else "partial_failure"
+    print(
+        json.dumps(
+            {"status": status, "failed_videos": len(failed), "reports": reports},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
     main()
-

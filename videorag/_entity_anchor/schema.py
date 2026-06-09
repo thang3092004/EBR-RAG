@@ -22,7 +22,6 @@ ENTITY_PREFIX = {
     "object": "OBJECT",
     "animal": "ANIMAL",
     "screen_element": "SCREEN",
-    "speaker": "SPEAKER",
 }
 
 

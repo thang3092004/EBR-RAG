@@ -68,6 +68,46 @@ def _torch_report() -> dict[str, Any]:
     return report
 
 
+def _spacy_model_report(model_name: str) -> dict[str, Any]:
+    try:
+        import spacy
+
+        nlp = spacy.load(model_name)
+        return {
+            "ok": True,
+            "model": model_name,
+            "pipeline": list(nlp.pipe_names),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "model": model_name,
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _embedding_report() -> dict[str, Any]:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    base_url = os.environ.get(
+        "OPENAI_BASE_URL",
+        "https://api.openai.com/v1",
+    ).strip()
+    return {
+        "ok": bool(api_key),
+        "provider": "openai_config",
+        "base_url": base_url,
+        "reason": None if api_key else "OPENAI_API_KEY is not set.",
+    }
+
+
+def _print_json(payload: dict[str, Any]) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", "backslashreplace").decode("ascii"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Validate a server before running Unified Graph V2."
@@ -78,19 +118,14 @@ def main() -> None:
         help="Local MiniCPM model directory; a missing path means HF fallback.",
     )
     parser.add_argument(
-        "--require-diarization",
-        action="store_true",
-        help="Treat pyannote and HF_TOKEN as required.",
-    )
-    parser.add_argument(
-        "--require-ocr",
-        action="store_true",
-        help="Treat PaddleOCR as required.",
-    )
-    parser.add_argument(
         "--strict",
         action="store_true",
         help="Exit non-zero when a required check fails.",
+    )
+    parser.add_argument(
+        "--spacy-model",
+        default="en_core_web_trf",
+        help="spaCy pipeline used for transcript entities.",
     )
     args = parser.parse_args()
 
@@ -112,19 +147,18 @@ def main() -> None:
         "faster_whisper": _package("faster-whisper", "faster_whisper"),
         "ultralytics": _package("ultralytics"),
         "spacy": _package("spacy"),
+        "spacy_model": _spacy_model_report(args.spacy_model),
         "open_clip": _package("open-clip-torch", "open_clip"),
-        "pyannote": _package("pyannote.audio", "pyannote.audio"),
-        "paddleocr": _package("paddleocr"),
+        "moviepy": _package("moviepy"),
+        "nano_vectordb": _package("nano-vectordb", "nano_vectordb"),
+        "imagebind": _package("imagebind"),
+        "pytorchvideo": _package("pytorchvideo"),
+        "openai": _package("openai"),
+        "embedding_api": _embedding_report(),
         "caption_model": {
             "ok": caption_path.is_dir(),
             "path": str(caption_path.resolve()),
             "fallback": "openbmb/MiniCPM-V-2_6-int4",
-        },
-        "tokens": {
-            "openai": bool(os.environ.get("OPENAI_API_KEY")),
-            "huggingface": bool(
-                os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
-            ),
         },
     }
 
@@ -138,25 +172,23 @@ def main() -> None:
         "faster_whisper",
         "ultralytics",
         "spacy",
+        "spacy_model",
         "open_clip",
+        "moviepy",
+        "nano_vectordb",
+        "imagebind",
+        "pytorchvideo",
+        "openai",
+        "embedding_api",
     ]
-    if args.require_diarization:
-        required.append("pyannote")
-    if args.require_ocr:
-        required.append("paddleocr")
-
     failures = [name for name in required if not checks[name].get("ok")]
-    if not checks["tokens"]["openai"]:
-        failures.append("OPENAI_API_KEY")
-    if args.require_diarization and not checks["tokens"]["huggingface"]:
-        failures.append("HF_TOKEN")
 
     report = {
         "status": "ready" if not failures else "not_ready",
         "required_failures": failures,
         "checks": checks,
     }
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    _print_json(report)
     if args.strict and failures:
         raise SystemExit(1)
 

@@ -331,32 +331,33 @@ def link_visual_tracklets(
 ) -> list[dict[str, Any]]:
     threshold = float(config.get("visual_merge_threshold", 0.85))
     disjoint = _DisjointSet([item["tracklet_id"] for item in tracklets])
-    for index, left in enumerate(tracklets):
-        for right in tracklets[index + 1 :]:
-            if left["entity_type"] != right["entity_type"]:
-                continue
-            if _overlap(left, right):
-                continue
-            gap = max(float(right["start"]) - float(left["end"]), 0.0)
-            clip_score = _cosine(
-                left.get("clip_embedding"),
-                right.get("clip_embedding"),
-            )
-            appearance_score = _cosine(
-                left.get("appearance"),
-                right.get("appearance"),
-            )
-            class_score = 1.0 if left["label"] == right["label"] else 0.0
-            temporal_score = math.exp(-gap / 300.0)
-            score = (
-                0.45 * clip_score
-                + 0.20 * class_score
-                + 0.15 * _motion_score(left, right)
-                + 0.10 * temporal_score
-                + 0.10 * appearance_score
-            )
-            if score >= threshold:
-                disjoint.union(left["tracklet_id"], right["tracklet_id"])
+    if not bool(config.get("disable_visual_identity_linking", False)):
+        for index, left in enumerate(tracklets):
+            for right in tracklets[index + 1 :]:
+                if left["entity_type"] != right["entity_type"]:
+                    continue
+                if _overlap(left, right):
+                    continue
+                gap = max(float(right["start"]) - float(left["end"]), 0.0)
+                clip_score = _cosine(
+                    left.get("clip_embedding"),
+                    right.get("clip_embedding"),
+                )
+                appearance_score = _cosine(
+                    left.get("appearance"),
+                    right.get("appearance"),
+                )
+                class_score = 1.0 if left["label"] == right["label"] else 0.0
+                temporal_score = math.exp(-gap / 300.0)
+                score = (
+                    0.45 * clip_score
+                    + 0.20 * class_score
+                    + 0.15 * _motion_score(left, right)
+                    + 0.10 * temporal_score
+                    + 0.10 * appearance_score
+                )
+                if score >= threshold:
+                    disjoint.union(left["tracklet_id"], right["tracklet_id"])
 
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for tracklet in tracklets:
@@ -422,170 +423,3 @@ def link_visual_tracklets(
             }
         )
     return visual_entities
-
-
-def _iou(left: list[float], right: list[float]) -> float:
-    x1 = max(left[0], right[0])
-    y1 = max(left[1], right[1])
-    x2 = min(left[2], right[2])
-    y2 = min(left[3], right[3])
-    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-    left_area = max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
-    right_area = max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1])
-    return intersection / max(left_area + right_area - intersection, 1e-12)
-
-
-def run_adaptive_deep_tracking(
-    video_path: str,
-    probe: dict[str, Any],
-    segments: list[dict[str, Any]],
-    profiles: list[dict[str, Any]],
-    base_observations: list[dict[str, Any]],
-    registry,
-    video_id: str,
-    config: dict[str, Any],
-    checkpoint_dir: str | Path,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Resample visual-rich segments and map detections back to base global IDs."""
-    try:
-        import cv2
-        from ultralytics import YOLO
-    except ImportError:
-        return base_observations, {
-            "available": False,
-            "reason": "tracking_dependencies_unavailable",
-            "deep_segments": 0,
-            "new_observations": 0,
-        }
-
-    profile_map = {item["segment_id"]: item for item in profiles}
-    selected_segments = [
-        segment
-        for segment in segments
-        if profile_map.get(segment["segment_id"], {}).get("mode") == "visual_rich"
-    ]
-    if not selected_segments:
-        return base_observations, {
-            "available": True,
-            "deep_segments": 0,
-            "new_observations": 0,
-        }
-
-    output_dir = Path(checkpoint_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    crop_dir = output_dir / "crops"
-    crop_dir.mkdir(parents=True, exist_ok=True)
-    model = YOLO(str(config.get("entity_tracking_model", "yolov8n.pt")))
-    capture = cv2.VideoCapture(video_path)
-    fps = float(probe.get("fps") or 30.0)
-    target_fps = float(config.get("entity_tracking_deep_fps", 6.0))
-    deep_observations = []
-    for segment in selected_segments:
-        segment_id = str(segment["segment_id"])
-        segment_path = output_dir / f"{segment_id}.json"
-        existing = read_json(segment_path)
-        if isinstance(existing, list):
-            deep_observations.extend(existing)
-            continue
-        items = _process_chunk(
-            model,
-            capture,
-            100000 + int(segment["index"]),
-            float(segment["context_start"]),
-            float(segment["context_end"]),
-            fps,
-            target_fps,
-            segments,
-            config,
-            crop_dir,
-        )
-        atomic_write_json(segment_path, items)
-        deep_observations.extend(items)
-    capture.release()
-    del model
-    gc.collect()
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except ImportError:
-        pass
-
-    base_by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for observation in base_observations:
-        base_by_type[str(observation.get("entity_type", "unknown"))].append(observation)
-
-    from .._unified_graph.schema import ProvenanceRecord
-
-    deep_tracklets = build_visual_tracklets(deep_observations)
-    new_entity_count = 0
-    for tracklet in deep_tracklets:
-        votes: dict[str, list[float]] = defaultdict(list)
-        for observation in tracklet["observations"]:
-            for base in base_by_type.get(tracklet["entity_type"], []):
-                if abs(float(base["time"]) - float(observation["time"])) > 0.40:
-                    continue
-                overlap = _iou(base["bbox"], observation["bbox"])
-                if overlap > 0:
-                    votes[str(base["entity_id"])].append(overlap)
-        ranked = sorted(
-            (
-                (entity_id, float(np.mean(scores)), len(scores))
-                for entity_id, scores in votes.items()
-            ),
-            key=lambda item: (item[1], item[2]),
-            reverse=True,
-        )
-        if ranked and ranked[0][1] >= 0.30:
-            entity_id = ranked[0][0]
-        else:
-            entity_id = registry.ensure_entity(
-                tracklet["entity_type"],
-                tracklet["label"],
-                source="visual",
-                confidence=float(
-                    np.mean(
-                        [
-                            item["confidence"]
-                            for item in tracklet["observations"]
-                        ]
-                    )
-                ),
-                attributes={"deep_tracking_only": True},
-            )
-            new_entity_count += 1
-        registry.add_alias(
-            tracklet["tracklet_id"],
-            entity_id,
-            source="visual",
-            label=tracklet["label"],
-            confidence=float(
-                np.mean([item["confidence"] for item in tracklet["observations"]])
-            ),
-        )
-        for observation in tracklet["observations"]:
-            observation["entity_id"] = entity_id
-            registry.add_provenance(
-                entity_id,
-                ProvenanceRecord(
-                    source="visual_deep",
-                    video_id=video_id,
-                    segment_id=str(observation["segment_id"]),
-                    start=float(observation["time"]),
-                    end=float(observation["time"]),
-                    frame_time=float(observation["time"]),
-                    bbox=list(observation["bbox"]),
-                    confidence=float(observation["confidence"]),
-                ),
-            )
-    merged = sorted(
-        [*base_observations, *deep_observations],
-        key=lambda item: float(item["time"]),
-    )
-    return merged, {
-        "available": True,
-        "deep_segments": len(selected_segments),
-        "new_observations": len(deep_observations),
-        "new_entities": new_entity_count,
-    }

@@ -10,8 +10,49 @@ from typing import Any
 from PIL import Image
 
 from ..pipeline.stage_runner import atomic_write_json, read_json
+from .correspondence import (
+    OpenCLIPTextEncoder,
+    gate_merge_candidates,
+    transcript_propositions,
+    visual_facts,
+)
 from .registry import EntityRegistry, normalize_alias
 from .schema import EdgeOccurrence, ProvenanceRecord
+
+
+VISUAL_FACT_PROMPT = """Analyze only the supplied video frames.
+
+Rules:
+1. Use only the visible entity IDs listed below.
+2. Do not use transcript knowledge or infer names.
+3. Describe observable appearance, action, pose, and interaction.
+4. Never invent an entity ID.
+5. Omit uncertain relations.
+
+Return JSON only:
+{{
+  "visual_caption": "A concise description using visible entity IDs.",
+  "entity_descriptions": [
+    {{
+      "entity_id": "PERSON_001",
+      "description": "A seated person wearing a dark shirt."
+    }}
+  ],
+  "visual_edges": [
+    {{
+      "source": "PERSON_001",
+      "predicate": "holds",
+      "target": "OBJECT_001",
+      "confidence": 0.0
+    }}
+  ]
+}}
+
+Segment: {segment_id}
+Time: {start:.2f}-{end:.2f}s
+Visible entities:
+{visual_entities}
+"""
 
 
 ALIGNMENT_PROMPT = """You are grounding one video segment into an entity graph.
@@ -20,11 +61,18 @@ Rules:
 1. Use only entity IDs and merge candidates explicitly listed below.
 2. Never invent an ID.
 3. Merge only when the frames and transcript clearly refer to the same entity.
-4. A speaker is a person only when the supplied speaker-person link says so.
-5. Return directed factual relations visible or explicitly stated in this segment.
-6. If uncertain, do not merge and omit the uncertain edge.
-7. For every edge, list only the evidence channels actually supporting it:
+4. Return directed factual relations visible or explicitly stated in this segment.
+5. If uncertain, do not merge and omit the uncertain edge.
+6. For every edge, list only the evidence channels actually supporting it:
    "visual", "transcript", or both.
+7. Transcript references marked unresolved are context, not new entities.
+   Use only an existing supplied entity ID when the memory and current
+   evidence make the antecedent clear; otherwise omit the uncertain edge.
+8. Allowed merge candidates have passed a train-free correspondence gate.
+   A passing score permits consideration but does not prove identity.
+9. Never merge merely because one person is visible while a person's name is
+   mentioned. Require the paired visual fact and transcript proposition to
+   describe the same grounded participant or interaction.
 
 Return JSON only:
 {{
@@ -49,7 +97,6 @@ Return JSON only:
 
 Segment: {segment_id}
 Time: {start:.2f}-{end:.2f}s
-Mode: {mode}
 
 Visible entities:
 {visual_entities}
@@ -60,14 +107,23 @@ Transcript entities:
 Allowed merge candidates:
 {merge_candidates}
 
-Accepted speaker-person links:
-{speaker_links}
+Visual-only facts:
+{visual_facts}
+
+Transcript propositions:
+{transcript_propositions}
 
 Recent event memory:
 {recent_memory}
 
 Entity state:
 {entity_state}
+
+Transcript discourse memory:
+{transcript_memory}
+
+Current transcript references:
+{transcript_references}
 
 Rewritten transcript:
 {transcript}
@@ -227,6 +283,7 @@ def _candidate_merges(
         existing = registry.resolve(label)
         if (
             existing
+            and not mention.get("generic")
             and mention["entity_type"] in {
                 "person",
                 "organization",
@@ -289,7 +346,12 @@ def _edge_id(video_id: str, counter: int) -> str:
 def _validate_alignment(
     raw: dict[str, Any],
     candidates: list[dict[str, Any]],
+    *,
+    visual_ids: set[str] | None = None,
+    text_ids: set[str] | None = None,
 ) -> dict[str, Any]:
+    visual_ids = visual_ids or set()
+    text_ids = text_ids or set()
     allowed = {
         (candidate["visual_id"], candidate["text_id"]) for candidate in candidates
     }
@@ -304,11 +366,30 @@ def _validate_alignment(
                     "reason": str(merge.get("reason", "")),
                 }
             )
+    merged_visual_ids = {
+        merge["visual_id"]
+        for merge in merges
+    }
     edges = []
     for edge in raw.get("edges", []):
         source = str(edge.get("source", "")).strip()
         target = str(edge.get("target", "")).strip()
         predicate = str(edge.get("predicate", "")).strip().lower().replace(" ", "_")
+        source_visual_only = source in visual_ids and source not in text_ids
+        target_visual_only = target in visual_ids and target not in text_ids
+        source_text_only = source in text_ids and source not in visual_ids
+        target_text_only = target in text_ids and target not in visual_ids
+        unsupported_cross_modal = (
+            source_visual_only
+            and target_text_only
+            and source not in merged_visual_ids
+        ) or (
+            target_visual_only
+            and source_text_only
+            and target not in merged_visual_ids
+        )
+        if unsupported_cross_modal:
+            continue
         if source and target and predicate and source != target:
             edges.append(
                 {
@@ -337,20 +418,89 @@ def _validate_alignment(
     }
 
 
+def _validate_visual_analysis(
+    raw: dict[str, Any],
+    visible_entities: list[dict[str, Any]],
+) -> dict[str, Any]:
+    allowed = {
+        str(entity["entity_id"])
+        for entity in visible_entities
+    }
+    descriptions = []
+    for item in raw.get("entity_descriptions", []):
+        entity_id = str(item.get("entity_id", "")).strip()
+        description = str(item.get("description", "")).strip()
+        if entity_id in allowed and description:
+            descriptions.append(
+                {
+                    "entity_id": entity_id,
+                    "description": description,
+                }
+            )
+    edges = []
+    for edge in raw.get("visual_edges", []):
+        source = str(edge.get("source", "")).strip()
+        target = str(edge.get("target", "")).strip()
+        predicate = (
+            str(edge.get("predicate", "")).strip().lower().replace(" ", "_")
+        )
+        if (
+            source in allowed
+            and target in allowed
+            and source != target
+            and predicate
+        ):
+            edges.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "predicate": predicate,
+                    "confidence": max(
+                        0.0,
+                        min(float(edge.get("confidence", 0.5)), 1.0),
+                    ),
+                    "modalities": ["visual"],
+                }
+            )
+    return {
+        "visual_caption": str(raw.get("visual_caption", "")).strip(),
+        "entity_descriptions": descriptions,
+        "visual_edges": edges,
+    }
+
+
+def _deduplicate_edges(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduplicated: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for edge in edges:
+        key = (edge["source"], edge["predicate"], edge["target"])
+        existing = deduplicated.get(key)
+        if existing is None:
+            deduplicated[key] = dict(edge)
+            continue
+        existing["confidence"] = max(
+            float(existing["confidence"]),
+            float(edge["confidence"]),
+        )
+        existing["modalities"] = sorted(
+            set(existing.get("modalities", []))
+            | set(edge.get("modalities", []))
+        )
+    return list(deduplicated.values())
+
+
 def align_all_segments(
     video_id: str,
     segments: list[dict[str, Any]],
-    profiles: list[dict[str, Any]],
     frame_selections: dict[str, dict[str, Any]],
     text_results: dict[str, dict[str, Any]],
     observations: list[dict[str, Any]],
-    speaker_links: list[dict[str, Any]],
     initial_registry: EntityRegistry,
     config: dict[str, Any],
     checkpoint_dir: str | Path,
     *,
     progress=None,
     aligner: MiniCPMAligner | None = None,
+    correspondence_encoder=None,
 ) -> dict[str, Any]:
     checkpoint_path = Path(checkpoint_dir)
     checkpoint_path.mkdir(parents=True, exist_ok=True)
@@ -366,20 +516,14 @@ def align_all_segments(
     next_index = int(state.get("next_index", 0))
     edge_counter = int(state.get("edge_counter", 0))
     aligner = aligner or MiniCPMAligner(config)
-    profile_map = {item["segment_id"]: item for item in profiles}
-
-    accepted_speaker_map: dict[str, str] = {}
-    for link in speaker_links:
-        person_global = registry.resolve(str(link["person_id"]))
-        if person_global:
-            accepted_speaker_map[str(link["speaker_id"])] = person_global
-            registry.add_alias(
-                str(link["speaker_id"]),
-                person_global,
-                source="audio_visual",
-                label="active speaker",
-                confidence=float(link["score"]),
-            )
+    crossmodal_enabled = not bool(
+        config.get("disable_crossmodal_alignment", False)
+    )
+    owns_correspondence_encoder = (
+        crossmodal_enabled and correspondence_encoder is None
+    )
+    if owns_correspondence_encoder:
+        correspondence_encoder = OpenCLIPTextEncoder(config)
 
     results: dict[str, dict[str, Any]] = {}
     for previous_index in range(next_index):
@@ -392,14 +536,16 @@ def align_all_segments(
         segment_id = str(segment["segment_id"])
         text_result = text_results.get(
             segment_id,
-            {"mentions": [], "claims": [], "rewritten_transcript": ""},
+            {"mentions": [], "rewritten_transcript": ""},
         )
         visible = _visible_entities(segment_id, observations)
-        candidates, deterministic = _candidate_merges(
+        raw_candidates, deterministic = _candidate_merges(
             visible,
             text_result.get("mentions", []),
             registry,
         )
+        if not crossmodal_enabled:
+            deterministic = {}
         for text_id, global_id in deterministic.items():
             mention = next(
                 item
@@ -433,6 +579,20 @@ def align_all_segments(
             text_result.get("rewritten_transcript", ""),
             registry,
         )
+        transcript_memory = _rewrite_ids(
+            json.dumps(
+                text_result.get("memory_context", {}),
+                ensure_ascii=False,
+            ),
+            registry,
+        )
+        transcript_references = _rewrite_ids(
+            json.dumps(
+                text_result.get("references", []),
+                ensure_ascii=False,
+            ),
+            registry,
+        )
         entity_state = [
             {
                 "entity_id": node.entity_id,
@@ -448,27 +608,116 @@ def align_all_segments(
             if node.last_seen is None
             or node.last_seen >= float(segment["start"]) - 120.0
         ][-20:]
+        frames = [
+            item["path"]
+            for item in frame_selections.get(segment_id, {}).get("frames", [])
+        ]
+        visual_prompt = VISUAL_FACT_PROMPT.format(
+            segment_id=segment_id,
+            start=float(segment["start"]),
+            end=float(segment["end"]),
+            visual_entities=json.dumps(visible, ensure_ascii=False),
+        )
+        raw_visual_analysis = (
+            aligner.align(visual_prompt, frames)
+            if visible and frames
+            else {}
+        )
+        visual_analysis = _validate_visual_analysis(
+            raw_visual_analysis,
+            visible,
+        )
+        facts = visual_facts(visual_analysis)
+        propositions = transcript_propositions(text_result, segment_id)
+        threshold = float(
+            config.get("correspondence_similarity_threshold", 0.28)
+        )
+        margin = float(
+            config.get("correspondence_similarity_margin", 0.04)
+        )
+        if (
+            crossmodal_enabled
+            and raw_candidates
+            and facts
+            and propositions
+            and correspondence_encoder is not None
+        ):
+            candidates, correspondence = gate_merge_candidates(
+                raw_candidates,
+                facts,
+                propositions,
+                correspondence_encoder.encode,
+                threshold=threshold,
+                margin=margin,
+            )
+        elif not crossmodal_enabled:
+            candidates = []
+            correspondence = {
+                "status": "disabled_by_ablation",
+                "threshold": threshold,
+                "margin": margin,
+                "pairs": [],
+            }
+        else:
+            candidates = []
+            correspondence = {
+                "status": "no_correspondence_evidence",
+                "threshold": threshold,
+                "margin": margin,
+                "pairs": [],
+            }
+        prompt_propositions = [
+            {
+                **proposition,
+                "text": _rewrite_ids(proposition["text"], registry),
+                "entity_ids": [
+                    registry.resolve(entity_id) or entity_id
+                    for entity_id in proposition.get("entity_ids", [])
+                ],
+            }
+            for proposition in propositions
+        ]
         prompt = ALIGNMENT_PROMPT.format(
             segment_id=segment_id,
             start=float(segment["start"]),
             end=float(segment["end"]),
-            mode=profile_map.get(segment_id, {}).get("mode", "balanced"),
             visual_entities=json.dumps(visible, ensure_ascii=False),
             text_entities=json.dumps(
                 prompt_mentions, ensure_ascii=False
             ),
             merge_candidates=json.dumps(candidates, ensure_ascii=False),
-            speaker_links=json.dumps(speaker_links, ensure_ascii=False),
+            visual_facts=json.dumps(facts, ensure_ascii=False),
+            transcript_propositions=json.dumps(
+                prompt_propositions,
+                ensure_ascii=False,
+            ),
             recent_memory=json.dumps(recent_events[-8:], ensure_ascii=False),
             entity_state=json.dumps(entity_state, ensure_ascii=False),
+            transcript_memory=transcript_memory,
+            transcript_references=transcript_references,
             transcript=prompt_transcript,
         )
-        frames = [
-            item["path"]
-            for item in frame_selections.get(segment_id, {}).get("frames", [])
-        ]
         raw_alignment = aligner.align(prompt, frames)
-        alignment = _validate_alignment(raw_alignment, candidates)
+        text_ids = {
+            str(mention["text_id"])
+            for mention in text_result.get("mentions", [])
+        }
+        text_ids.update(
+            str(mention["text_id"])
+            for mention in prompt_mentions
+        )
+        alignment = _validate_alignment(
+            raw_alignment,
+            candidates,
+            visual_ids={
+                str(entity["entity_id"])
+                for entity in visible
+            },
+            text_ids=text_ids,
+        )
+        alignment["edges"] = _deduplicate_edges(
+            visual_analysis["visual_edges"] + alignment["edges"]
+        )
 
         for merge in alignment["entity_merges"]:
             mention = next(
@@ -486,34 +735,48 @@ def align_all_segments(
             )
 
         for mention in text_result.get("mentions", []):
-            if registry.resolve(mention["text_id"]):
-                continue
-            global_id = registry.ensure_entity(
-                mention["entity_type"],
-                mention["label"],
-                source="transcript",
-                confidence=float(mention.get("confidence", 0.0)),
-            )
-            registry.add_alias(
-                mention["text_id"],
-                global_id,
-                source="transcript",
-                label=mention["label"],
-                confidence=float(mention.get("confidence", 0.0)),
-                segment_id=segment_id,
-            )
-            registry.add_provenance(
-                global_id,
-                ProvenanceRecord(
+            global_id = registry.resolve(mention["text_id"])
+            if not global_id:
+                global_id = registry.ensure_entity(
+                    mention["entity_type"],
+                    mention["label"],
                     source="transcript",
-                    video_id=video_id,
-                    segment_id=segment_id,
-                    start=float(mention["start"]),
-                    end=float(mention["end"]),
-                    text=mention["label"],
                     confidence=float(mention.get("confidence", 0.0)),
-                ),
-            )
+                )
+                registry.add_alias(
+                    mention["text_id"],
+                    global_id,
+                    source="transcript",
+                    label=mention["label"],
+                    confidence=float(mention.get("confidence", 0.0)),
+                    segment_id=segment_id,
+                )
+            occurrences = mention.get("occurrences") or [
+                {
+                    "start": mention["start"],
+                    "end": mention["end"],
+                    "text": mention["label"],
+                    "confidence": mention.get("confidence", 0.0),
+                }
+            ]
+            for occurrence in occurrences:
+                registry.add_provenance(
+                    global_id,
+                    ProvenanceRecord(
+                        source="transcript",
+                        video_id=video_id,
+                        segment_id=segment_id,
+                        start=float(occurrence["start"]),
+                        end=float(occurrence["end"]),
+                        text=str(occurrence.get("text", mention["label"])),
+                        confidence=float(
+                            occurrence.get(
+                                "confidence",
+                                mention.get("confidence", 0.0),
+                            )
+                        ),
+                    ),
+                )
 
         edges: list[dict[str, Any]] = []
         for raw_edge in alignment["edges"]:
@@ -534,7 +797,15 @@ def align_all_segments(
                 modalities=raw_edge["modalities"],
                 provenance=[
                     ProvenanceRecord(
-                        source="minicpm_alignment",
+                        source=(
+                            "minicpm_visual"
+                            if raw_edge["modalities"] == ["visual"]
+                            else (
+                                "minicpm_transcript"
+                                if raw_edge["modalities"] == ["transcript"]
+                                else "minicpm_alignment"
+                            )
+                        ),
                         video_id=video_id,
                         segment_id=segment_id,
                         start=float(segment["start"]),
@@ -549,96 +820,6 @@ def align_all_segments(
                 f"{video_id}_{segment.get('index', index)}",
             )
             edges.append(edge_payload)
-
-        for claim in text_result.get("claims", []):
-            claim_global = registry.ensure_entity(
-                "claim",
-                claim["text"],
-                source="transcript",
-                confidence=float(claim.get("confidence", 0.0)),
-            )
-            registry.add_alias(
-                claim["text_id"],
-                claim_global,
-                source="transcript",
-                label=claim["text"],
-                confidence=float(claim.get("confidence", 0.0)),
-                segment_id=segment_id,
-            )
-            registry.add_provenance(
-                claim_global,
-                ProvenanceRecord(
-                    source="transcript",
-                    video_id=video_id,
-                    segment_id=segment_id,
-                    start=float(claim["start"]),
-                    end=float(claim["end"]),
-                    text=claim["text"],
-                    confidence=float(claim.get("confidence", 0.0)),
-                ),
-            )
-            speaker_alias = str(claim.get("speaker_id") or "SPEAKER_UNKNOWN")
-            speaker_global = (
-                accepted_speaker_map.get(speaker_alias)
-                or registry.resolve(speaker_alias)
-            )
-            if not speaker_global:
-                speaker_global = registry.ensure_entity(
-                    "speaker",
-                    "unattributed speaker",
-                    source="transcript",
-                    confidence=0.25,
-                )
-                registry.add_alias(
-                    speaker_alias,
-                    speaker_global,
-                    source="transcript",
-                    label="unattributed speaker",
-                    confidence=0.25,
-                    segment_id=segment_id,
-                )
-            registry.add_provenance(
-                speaker_global,
-                ProvenanceRecord(
-                    source="audio",
-                    video_id=video_id,
-                    segment_id=segment_id,
-                    start=float(claim["start"]),
-                    end=float(claim["end"]),
-                    text=speaker_alias,
-                    confidence=(
-                        0.90 if speaker_alias in accepted_speaker_map else 0.25
-                    ),
-                ),
-            )
-            edge_counter += 1
-            claim_edge = EdgeOccurrence(
-                    edge_id=_edge_id(video_id, edge_counter),
-                    source_id=speaker_global,
-                    target_id=claim_global,
-                    predicate="says",
-                    start=float(claim["start"]),
-                    end=float(claim["end"]),
-                    segment_id=segment_id,
-                    confidence=float(claim.get("confidence", 0.0)),
-                    modalities=["transcript"],
-                    provenance=[
-                        ProvenanceRecord(
-                            source="transcript",
-                            video_id=video_id,
-                            segment_id=segment_id,
-                            start=float(claim["start"]),
-                            end=float(claim["end"]),
-                            text=claim["text"],
-                            confidence=float(claim.get("confidence", 0.0)),
-                        )
-                    ],
-                ).to_dict()
-            claim_edge["storage_id"] = segment.get(
-                "storage_id",
-                f"{video_id}_{segment.get('index', index)}",
-            )
-            edges.append(claim_edge)
 
         caption = _rewrite_ids(alignment["caption"], registry)
         rewritten_transcript = _rewrite_ids(
@@ -679,8 +860,11 @@ def align_all_segments(
             "edges": edges,
             "accepted_merges": alignment["entity_merges"],
             "candidate_merges": candidates,
+            "raw_candidate_merges": raw_candidates,
+            "correspondence": correspondence,
+            "visual_analysis": visual_analysis,
+            "transcript_propositions": propositions,
             "frame_paths": frames,
-            "mode": profile_map.get(segment_id, {}).get("mode", "balanced"),
             "memory_delta": memory_delta,
         }
         atomic_write_json(checkpoint_path / f"{segment_id}.json", segment_result)
@@ -700,12 +884,24 @@ def align_all_segments(
                 index + 1,
                 entities=len(registry.entities),
                 edges=edge_counter,
+                correspondence=correspondence["status"],
+                gated_candidates=len(candidates),
+                accepted_merges=len(alignment["entity_merges"]),
             )
 
+    if owns_correspondence_encoder and correspondence_encoder is not None:
+        correspondence_encoder.close()
+    correspondence_stats: dict[str, int] = defaultdict(int)
+    for segment in results.values():
+        status = str(
+            segment.get("correspondence", {}).get("status", "unknown")
+        )
+        correspondence_stats[status] += 1
     return {
         "segments": results,
         "registry": registry.to_dict(),
         "edge_count": edge_counter,
         "recent_events": recent_events,
         "long_term_state": long_term_state,
+        "correspondence_stats": dict(correspondence_stats),
     }

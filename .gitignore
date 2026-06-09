@@ -36,12 +36,17 @@ cg-bench/videorag-workdir/
 # --- Results & Evaluations ---
 custom_eval_results_17/
 reproduce/all_answers/
+reproduce/minimal_ablation_answers/
 reproduce/winrate_comparison/batch_*.json
 judge_output.json
 *.md
 !README.md
-!ENTITY_ANCHORED_TM_GRAPH_PLAN.md
+!UNIFIED_ENTITY_GRAPH_PLAN.md
 !SERVER_UNIFIED_V2.md
+!GRAPH_ABLATION_PLAN.md
+!MINIMAL_ABLATION_0_6_11.md
+/.pytest_tmp*/
+/.tmp_ablation*/
 !papers/
 !papers/**/*.md
 !Papers/

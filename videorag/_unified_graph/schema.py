@@ -12,8 +12,6 @@ GLOBAL_PREFIXES = {
     "organization": "ORGANIZATION",
     "concept": "CONCEPT",
     "event": "EVENT",
-    "claim": "CLAIM",
-    "speaker": "SPEAKER",
     "screen_element": "SCREEN_ELEMENT",
     "unknown": "ENTITY",
 }
@@ -103,4 +101,3 @@ class EdgeOccurrence:
         data = asdict(self)
         data["provenance"] = [item.to_dict() for item in self.provenance]
         return data
-

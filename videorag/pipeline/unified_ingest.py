@@ -13,33 +13,25 @@ import numpy as np
 from tqdm import tqdm
 
 from .._entity_anchor.appearance import attach_openclip_embeddings
-from .._entity_anchor.audio import (
-    accepted_speaker_links,
-    assign_speakers_to_words,
-    run_speaker_diarization,
-    run_talknet_adapter,
-)
 from .._entity_anchor.text_entities import TextEntityExtractor
 from .._entity_anchor.tracker_v2 import (
     build_visual_tracklets,
     link_visual_tracklets,
-    run_adaptive_deep_tracking,
     run_chunked_tracking,
 )
 from .._op import get_chunks
 from .._unified_graph.alignment import MiniCPMAligner, align_all_segments
 from .._unified_graph.builder import build_unified_graph, validate_unified_graph
+from .._unified_graph.correspondence import OpenCLIPTextEncoder
 from .._unified_graph.registry import EntityRegistry, normalize_alias
 from .._videoutil.asr_v2 import (
     assign_words_to_segments,
-    render_segment_transcript,
     transcribe_full_video,
 )
-from .._videoutil.frame_selector import run_ocr, select_segment_frames
+from .._videoutil.frame_selector import select_segment_frames
 from .._videoutil.media_probe import probe_video
-from .._videoutil.modality import profile_modalities
 from .._videoutil.shot_detection import detect_shots_and_motion
-from .._videoutil.smart_segment import smart_segment
+from .._videoutil.smart_segment import fixed_segment, smart_segment
 from .._utils import compute_mdhash_id, logger
 from .stage_runner import StageRunner, atomic_write_json, read_json
 from .unified_stages import UNIFIED_STAGE_DEFINITIONS
@@ -224,11 +216,15 @@ class UnifiedIngestPipeline:
         self.restart_stage = restart_stage
         self.force = force
         self.loop = asyncio.new_event_loop()
+        self.correspondence_encoder = None
 
     def _await(self, awaitable):
         return self.loop.run_until_complete(awaitable)
 
     def close(self) -> None:
+        if self.correspondence_encoder is not None:
+            self.correspondence_encoder.close()
+            self.correspondence_encoder = None
         self.loop.close()
 
     def run(self, video_paths: list[str]) -> list[dict[str, Any]]:
@@ -249,7 +245,28 @@ class UnifiedIngestPipeline:
                         len(video_paths),
                         video_id,
                     )
-                    reports.append(self.run_video(video_path))
+                    try:
+                        reports.append(self.run_video(video_path))
+                    except Exception as exc:
+                        if not self.config.get(
+                            "pipeline_continue_on_error",
+                            False,
+                        ):
+                            raise
+                        logger.exception(
+                            "[Unified V2] Video failed; continuing: %s",
+                            video_id,
+                        )
+                        reports.append(
+                            {
+                                "video_id": video_id,
+                                "status": "failed",
+                                "error": {
+                                    "type": type(exc).__name__,
+                                    "message": str(exc),
+                                },
+                            }
+                        )
                     video_progress.update(1)
             return reports
         finally:
@@ -291,16 +308,8 @@ class UnifiedIngestPipeline:
                 lambda context: self._stage_tracking(context, runner, video_id),
             )
             runner.run_stage(
-                "modality_profile",
-                lambda context: self._stage_modality(context, runner),
-            )
-            runner.run_stage(
-                "deep_processing",
-                lambda context: self._stage_deep(context, runner),
-            )
-            runner.run_stage(
-                "speaker_linking",
-                lambda context: self._stage_speakers(context, runner),
+                "frame_selection",
+                lambda context: self._stage_frames(context, runner),
             )
             runner.run_stage(
                 "text_entities",
@@ -410,12 +419,31 @@ class UnifiedIngestPipeline:
         probe = read_json(runner.output("probe", "probe.json"))
         asr = read_json(runner.output("asr", "asr.json"))
         shots = read_json(runner.output("shot_detection", "shots.json"))
-        segments = smart_segment(
-            float(probe["duration"]),
-            asr["words"],
-            shots["boundaries"],
-            self.config,
-        )
+        strategy = str(
+            self.config.get("segmentation_strategy", "adaptive")
+        ).strip().lower()
+        if strategy == "adaptive":
+            segments = smart_segment(
+                float(probe["duration"]),
+                asr["words"],
+                shots["boundaries"],
+                self.config,
+            )
+        elif strategy == "fixed":
+            segments = fixed_segment(
+                float(probe["duration"]),
+                length=float(
+                    self.config.get("fixed_segment_seconds", 30.0)
+                ),
+                context=float(
+                    self.config.get("segment_context_seconds", 1.5)
+                ),
+            )
+        else:
+            raise ValueError(
+                "segmentation_strategy must be 'adaptive' or 'fixed', "
+                f"got {strategy!r}"
+            )
         for segment in segments:
             segment["storage_id"] = f"{video_id}_{segment['index']}"
         context.write_json("segments.json", segments)
@@ -425,10 +453,12 @@ class UnifiedIngestPipeline:
             min_duration=min(durations, default=0.0),
             max_duration=max(durations, default=0.0),
             mean_duration=float(np.mean(durations)) if durations else 0.0,
+            strategy=strategy,
         )
         return {
             "output": str(context.path("segments.json")),
             "segments": len(segments),
+            "strategy": strategy,
         }
 
     def _stage_tracking(
@@ -475,6 +505,9 @@ class UnifiedIngestPipeline:
                 if embedding_report.get("available")
                 else embedding_report.get("reason")
             ),
+            identity_linking=not bool(
+                self.config.get("disable_visual_identity_linking", False)
+            ),
         )
         return {
             "observations": len(observations),
@@ -483,60 +516,19 @@ class UnifiedIngestPipeline:
             "appearance": embedding_report,
         }
 
-    def _stage_modality(self, context, runner: StageRunner) -> dict[str, Any]:
-        segments = read_json(runner.output("segmentation", "segments.json"))
-        asr = read_json(runner.output("asr", "asr.json"))
-        shots = read_json(runner.output("shot_detection", "shots.json"))
-        observations = read_json(
-            runner.output("tracking_base", "observations.json"),
-            [],
-        )
-        profiles = profile_modalities(
-            segments,
-            asr["words"],
-            shots,
-            observations,
-            self.config,
-        )
-        context.write_json("profiles.json", profiles)
-        counts: dict[str, int] = {}
-        for profile in profiles:
-            counts[profile["mode"]] = counts.get(profile["mode"], 0) + 1
-        context.report_metrics(**counts)
-        return {"output": str(context.path("profiles.json")), "counts": counts}
-
-    def _stage_deep(self, context, runner: StageRunner) -> dict[str, Any]:
+    def _stage_frames(self, context, runner: StageRunner) -> dict[str, Any]:
         probe = read_json(runner.output("probe", "probe.json"))
         segments = read_json(runner.output("segmentation", "segments.json"))
         shots = read_json(runner.output("shot_detection", "shots.json"))
-        profiles = read_json(runner.output("modality_profile", "profiles.json"))
         observations = read_json(
             runner.output("tracking_base", "observations.json"),
             [],
         )
-        registry = EntityRegistry(
-            read_json(runner.output("tracking_base", "registry.json"))
-        )
-        observations, deep_tracking_report = run_adaptive_deep_tracking(
-            probe["path"],
-            probe,
-            segments,
-            profiles,
-            observations,
-            registry,
-            Path(probe["path"]).stem,
-            self.config,
-            context.path("deep_tracking"),
-        )
-        context.write_json("observations.json", observations)
-        context.write_json("registry.json", registry.to_dict())
-        context.write_json("deep_tracking_report.json", deep_tracking_report)
-        profile_map = {item["segment_id"]: item for item in profiles}
         selections: dict[str, dict[str, Any]] = {}
         with context.progress(
             total=len(segments),
             unit="seg",
-            description="Adaptive frame/OCR processing",
+            description="Diverse frame selection",
         ) as progress:
             for index, segment in enumerate(segments):
                 segment_id = segment["segment_id"]
@@ -549,28 +541,15 @@ class UnifiedIngestPipeline:
                 selection = select_segment_frames(
                     probe["path"],
                     segment,
-                    profile_map[segment_id],
                     shots,
                     observations,
                     context.path("frames"),
                     self.config,
                 )
-                if profile_map[segment_id]["mode"] in {"visual_rich", "balanced"}:
-                    selection["ocr"] = run_ocr(
-                        selection.get("frames", []),
-                        self.config,
-                    )
-                else:
-                    selection["ocr"] = {
-                        "available": False,
-                        "reason": "speech_rich_budget",
-                        "items": [],
-                    }
                 atomic_write_json(result_path, selection)
                 selections[segment_id] = selection
                 progress.set(
                     index + 1,
-                    mode=profile_map[segment_id]["mode"],
                     frames=len(selection.get("frames", [])),
                 )
         context.write_json("frame_selections.json", selections)
@@ -578,110 +557,99 @@ class UnifiedIngestPipeline:
             selected_frames=sum(
                 len(item.get("frames", [])) for item in selections.values()
             ),
-            ocr_segments=sum(
-                1
-                for item in selections.values()
-                if item.get("ocr", {}).get("available")
-            ),
-            deep_tracking_segments=deep_tracking_report.get("deep_segments", 0),
-            deep_tracking_observations=deep_tracking_report.get(
-                "new_observations", 0
-            ),
         )
         return {
             "segments": len(selections),
             "selected_frames": sum(
                 len(item.get("frames", [])) for item in selections.values()
             ),
-            "deep_tracking": deep_tracking_report,
-        }
-
-    def _stage_speakers(self, context, runner: StageRunner) -> dict[str, Any]:
-        probe = read_json(runner.output("probe", "probe.json"))
-        asr = read_json(runner.output("asr", "asr.json"))
-        with context.progress(
-            total=float(probe["duration"]),
-            unit="s",
-            description="Speaker diarization",
-        ) as progress:
-            if probe.get("has_audio") is False:
-                diarization = {
-                    "available": False,
-                    "reason": "no_audio_stream",
-                    "turns": [],
-                }
-                progress.set(float(probe["duration"]), reason="no_audio_stream")
-            else:
-                diarization = run_speaker_diarization(
-                    probe["path"],
-                    self.config,
-                    progress=progress,
-                )
-        words = assign_speakers_to_words(asr["words"], diarization.get("turns", []))
-        talknet_output = context.path("talknet.json")
-        talknet = run_talknet_adapter(
-            probe["path"],
-            str(runner.output("deep_processing", "observations.json")),
-            str(talknet_output),
-            self.config,
-        )
-        accepted = accepted_speaker_links(talknet, self.config)
-        result = {
-            "diarization": diarization,
-            "talknet": talknet,
-            "accepted_links": accepted,
-            "words": words,
-        }
-        context.write_json("speakers.json", result)
-        context.report_metrics(
-            diarization_available=diarization.get("available", False),
-            speakers=diarization.get("speaker_count", 0),
-            talknet_available=talknet.get("available", False),
-            accepted_links=len(accepted),
-        )
-        return {
-            "output": str(context.path("speakers.json")),
-            "speakers": diarization.get("speaker_count", 0),
-            "accepted_links": len(accepted),
         }
 
     def _stage_text(self, context, runner: StageRunner) -> dict[str, Any]:
         segments = read_json(runner.output("segmentation", "segments.json"))
-        speaker_result = read_json(
-            runner.output("speaker_linking", "speakers.json")
-        )
+        asr = read_json(runner.output("asr", "asr.json"))
         by_segment = assign_words_to_segments(
-            speaker_result["words"],
+            asr["words"],
             segments,
         )
-        extractor = TextEntityExtractor(self.config)
+        checkpoint = context.load_checkpoint(default={}) or {}
+        next_index = int(checkpoint.get("next_index", 0))
+        extractor = TextEntityExtractor(
+            self.config,
+            state=checkpoint.get("extractor"),
+        )
         results = {}
+        for previous_index in range(next_index):
+            segment_id = segments[previous_index]["segment_id"]
+            previous = read_json(
+                context.path(f"segments/{segment_id}.json")
+            )
+            if previous:
+                results[segment_id] = previous
         with context.progress(
             total=len(segments),
             unit="seg",
-            description="Transcript entity and claim extraction",
+            description="Transcript entity extraction",
+            completed=next_index,
         ) as progress:
-            for index, segment in enumerate(segments):
+            for index, segment in enumerate(
+                segments[next_index:],
+                start=next_index,
+            ):
                 segment_id = segment["segment_id"]
                 result = extractor.extract_segment(
                     segment,
                     by_segment.get(segment_id, []),
                 )
                 results[segment_id] = result
+                atomic_write_json(
+                    context.path(f"segments/{segment_id}.json"),
+                    result,
+                )
+                context.save_checkpoint(
+                    {
+                        "next_index": index + 1,
+                        "extractor": extractor.to_state(),
+                    }
+                )
                 progress.set(
                     index + 1,
-                    entities=sum(len(item["mentions"]) for item in results.values()),
-                    claims=sum(len(item["claims"]) for item in results.values()),
+                    entities=sum(
+                        len(item["mentions"]) for item in results.values()
+                    ),
+                    resolved_references=sum(
+                        1
+                        for item in results.values()
+                        for reference in item.get("references", [])
+                        if reference.get("status") == "resolved"
+                    ),
                 )
         context.write_json("text_entities.json", results)
+        context.write_json("text_memory.json", extractor.memory.to_state())
+        resolved_references = sum(
+            1
+            for item in results.values()
+            for reference in item.get("references", [])
+            if reference.get("status") == "resolved"
+        )
+        unresolved_references = sum(
+            1
+            for item in results.values()
+            for reference in item.get("references", [])
+            if reference.get("status") == "unresolved"
+        )
         context.report_metrics(
             backend=extractor.backend,
             mentions=sum(len(item["mentions"]) for item in results.values()),
-            claims=sum(len(item["claims"]) for item in results.values()),
+            resolved_references=resolved_references,
+            unresolved_references=unresolved_references,
         )
         return {
             "output": str(context.path("text_entities.json")),
+            "memory": str(context.path("text_memory.json")),
             "backend": extractor.backend,
+            "resolved_references": resolved_references,
+            "unresolved_references": unresolved_references,
         }
 
     def _stage_alignment(
@@ -691,27 +659,33 @@ class UnifiedIngestPipeline:
         video_id: str,
     ) -> dict[str, Any]:
         segments = read_json(runner.output("segmentation", "segments.json"))
-        profiles = read_json(runner.output("modality_profile", "profiles.json"))
         selections = read_json(
-            runner.output("deep_processing", "frame_selections.json")
+            runner.output("frame_selection", "frame_selections.json")
         )
         text_results = read_json(
             runner.output("text_entities", "text_entities.json")
         )
         observations = read_json(
-            runner.output("deep_processing", "observations.json")
-        )
-        speakers = read_json(
-            runner.output("speaker_linking", "speakers.json")
+            runner.output("tracking_base", "observations.json")
         )
         registry = EntityRegistry(
-            read_json(runner.output("deep_processing", "registry.json"))
+            read_json(runner.output("tracking_base", "registry.json"))
         )
+        if (
+            getattr(self.vrag, "caption_model", None) is None
+            or getattr(self.vrag, "caption_tokenizer", None) is None
+        ):
+            self.vrag.load_caption_model()
         aligner = MiniCPMAligner(
             self.config,
             model=getattr(self.vrag, "caption_model", None),
             tokenizer=getattr(self.vrag, "caption_tokenizer", None),
         )
+        crossmodal_enabled = not bool(
+            self.config.get("disable_crossmodal_alignment", False)
+        )
+        if crossmodal_enabled and self.correspondence_encoder is None:
+            self.correspondence_encoder = OpenCLIPTextEncoder(self.config)
         with context.progress(
             total=len(segments),
             unit="seg",
@@ -721,16 +695,15 @@ class UnifiedIngestPipeline:
                 result = align_all_segments(
                     video_id,
                     segments,
-                    profiles,
                     selections,
                     text_results,
                     observations,
-                    speakers.get("accepted_links", []),
                     registry,
                     self.config,
                     context.path("segments"),
                     progress=progress,
                     aligner=aligner,
+                    correspondence_encoder=self.correspondence_encoder,
                 )
             finally:
                 aligner.close()
@@ -747,12 +720,15 @@ class UnifiedIngestPipeline:
             edges=result["edge_count"],
             model="MiniCPM-V-2_6-int4",
             stale_entities=len(stale_entity_ids),
+            correspondence=result.get("correspondence_stats", {}),
+            crossmodal_alignment=crossmodal_enabled,
         )
         return {
             "output": str(context.path("alignment.json")),
             "entities": len(result["registry"]["entities"]),
             "edges": result["edge_count"],
             "model": "MiniCPM-V-2_6-int4",
+            "correspondence": result.get("correspondence_stats", {}),
         }
 
     def _segment_storage_payload(
@@ -764,11 +740,9 @@ class UnifiedIngestPipeline:
         alignment = read_json(
             runner.output("alignment_caption", "alignment.json")
         )
-        profiles = read_json(runner.output("modality_profile", "profiles.json"))
         selections = read_json(
-            runner.output("deep_processing", "frame_selections.json")
+            runner.output("frame_selection", "frame_selections.json")
         )
-        profile_map = {item["segment_id"]: item for item in profiles}
         payload = {}
         for segment in segments:
             segment_id = segment["segment_id"]
@@ -804,7 +778,6 @@ class UnifiedIngestPipeline:
                 ],
                 "segment_id": segment_id,
                 "storage_id": segment["storage_id"],
-                "modality_profile": profile_map[segment_id],
             }
         return payload
 

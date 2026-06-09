@@ -188,3 +188,36 @@ def smart_segment(
         )
     return segments
 
+
+def fixed_segment(
+    duration: float,
+    *,
+    length: float = 30.0,
+    context: float = 1.5,
+) -> list[dict[str, Any]]:
+    if duration < 0:
+        raise ValueError("Video duration cannot be negative.")
+    if length <= 0:
+        raise ValueError("Fixed segment length must be positive.")
+    if duration == 0:
+        return []
+
+    segments = []
+    start = 0.0
+    index = 0
+    while start < duration:
+        end = min(start + length, duration)
+        segments.append(
+            {
+                "segment_id": f"SEG_{index:05d}",
+                "index": index,
+                "start": float(start),
+                "end": float(end),
+                "duration": float(end - start),
+                "context_start": max(0.0, float(start) - context),
+                "context_end": min(duration, float(end) + context),
+            }
+        )
+        start = end
+        index += 1
+    return segments

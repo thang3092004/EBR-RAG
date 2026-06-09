@@ -7,13 +7,13 @@ from videorag.pipeline.unified_ingest import _merge_global_registry
 def _entity_payload(video_id, label, entity_id):
     registry = EntityRegistry()
     entity_id = registry.ensure_entity(
-        "claim",
+        "concept",
         label,
         entity_id=entity_id,
         source="transcript",
     )
     registry.add_alias(
-        "T_CLAIM_001",
+        "T_CONCEPT_001",
         entity_id,
         source="transcript",
         label=label,
@@ -40,12 +40,12 @@ def test_global_registry_replaces_only_the_rerun_video(tmp_path):
     _merge_global_registry(
         tmp_path,
         "video_a",
-        _entity_payload("video_a", "A", "CLAIM_001"),
+        _entity_payload("video_a", "A", "CONCEPT_001"),
     )
     _merge_global_registry(
         tmp_path,
         "video_b",
-        _entity_payload("video_b", "B", "CLAIM_002"),
+        _entity_payload("video_b", "B", "CONCEPT_002"),
     )
     before = read_json(root / "global_registry.json")
     assert len(before["entities"]) == 2
@@ -53,7 +53,7 @@ def test_global_registry_replaces_only_the_rerun_video(tmp_path):
     removed = _merge_global_registry(
         tmp_path,
         "video_a",
-        _entity_payload("video_a", "A rerun", "CLAIM_003"),
+        _entity_payload("video_a", "A rerun", "CONCEPT_003"),
     )
     after = read_json(root / "global_registry.json")
 

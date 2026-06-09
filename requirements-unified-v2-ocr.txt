@@ -1,4 +1,0 @@
--r requirements-unified-v2.txt
-
-# Install a CUDA-compatible PaddlePaddle wheel before this file on GPU servers.
-paddleocr>=2.8,<3

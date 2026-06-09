@@ -18,7 +18,12 @@ from typing import Any, Callable, Iterator
 from tqdm import tqdm
 
 
-PIPELINE_VERSION = "unified-graph-v2"
+PIPELINE_VERSION = "unified-graph-v3-ablation"
+REMOVED_STAGE_NAMES = {
+    "modality_profile",
+    "deep_processing",
+    "speaker_linking",
+}
 
 
 def _utc_now() -> str:
@@ -293,8 +298,11 @@ class StageRunner:
 
     def _prepare_manifest(self, restart_stage: str | None, force: bool) -> None:
         if force or self.manifest.get("pipeline_version") != PIPELINE_VERSION:
-            for definition in self.stages:
-                stage_dir = self.video_dir / definition.name
+            stage_names = {
+                definition.name for definition in self.stages
+            } | REMOVED_STAGE_NAMES
+            for stage_name in stage_names:
+                stage_dir = self.video_dir / stage_name
                 if stage_dir.exists():
                     shutil.rmtree(stage_dir)
             self.manifest = {
@@ -389,7 +397,6 @@ class StageRunner:
                     "asr_model",
                     "entity_tracking_model",
                     "entity_tracking_fps",
-                    "entity_tracking_deep_fps",
                     "caption_backend",
                     "segment_target_seconds",
                     "frame_min",

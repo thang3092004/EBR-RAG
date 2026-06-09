@@ -17,12 +17,9 @@ _EXPORTS = {
     "probe_video": (".media_probe", "probe_video"),
     "transcribe_full_video": (".asr_v2", "transcribe_full_video"),
     "assign_words_to_segments": (".asr_v2", "assign_words_to_segments"),
-    "render_segment_transcript": (".asr_v2", "render_segment_transcript"),
     "detect_shots_and_motion": (".shot_detection", "detect_shots_and_motion"),
     "smart_segment": (".smart_segment", "smart_segment"),
-    "profile_modalities": (".modality", "profile_modalities"),
     "select_segment_frames": (".frame_selector", "select_segment_frames"),
-    "run_ocr": (".frame_selector", "run_ocr"),
 }
 
 __all__ = sorted(_EXPORTS)

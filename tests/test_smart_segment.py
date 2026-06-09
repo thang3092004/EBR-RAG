@@ -1,4 +1,4 @@
-from videorag._videoutil.smart_segment import smart_segment
+from videorag._videoutil.smart_segment import fixed_segment, smart_segment
 
 
 def test_smart_segmentation_uses_safe_boundaries():
@@ -31,3 +31,14 @@ def test_short_tail_is_kept_without_exceeding_maximum():
     assert segments[-1]["end"] == 49.0
     assert max(segment["duration"] for segment in segments) <= 45.0
 
+
+def test_fixed_segmentation_uses_non_overlapping_30_second_windows():
+    segments = fixed_segment(65.0, length=30.0, context=1.5)
+
+    assert [(item["start"], item["end"]) for item in segments] == [
+        (0.0, 30.0),
+        (30.0, 60.0),
+        (60.0, 65.0),
+    ]
+    assert segments[1]["context_start"] == 28.5
+    assert segments[1]["context_end"] == 61.5

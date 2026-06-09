@@ -140,7 +140,6 @@ PROMPTS["DEFAULT_ENTITY_TYPES"] = [
     "object",
     "animal",
     "screen_element",
-    "speaker",
     "geo",
     "location",
     "event",
@@ -457,7 +456,7 @@ Key points:
 TM_PROMPT_ADDITIONS = {
     "entity_extraction": """-Goal-
 Given a text document that is potentially relevant to this activity, a list of entity types, and a "Short-Term Memory" of recently extracted entities and relationships from the preceding parts of this video/document, identify all entities and relationships from the text.
-The text may contain an "Entity Memory" section with grounded IDs such as PERSON_001, OBJECT_003, ANIMAL_002, SCREEN_001, or SPEAKER_001. These IDs come from visual/audio tracking and are more reliable than free-form names.
+The text may contain an "Entity Memory" section with grounded IDs such as PERSON_001, OBJECT_003, ANIMAL_002, or SCREEN_001. These IDs come from visual tracking and transcript entity linking and are more reliable than free-form names.
 You MUST prioritize exact grounded IDs from Entity Memory and exact entities listed in Short-Term Memory when you encounter them again in the text.
 
 -Steps-
