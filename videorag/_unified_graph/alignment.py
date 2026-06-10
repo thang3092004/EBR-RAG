@@ -232,13 +232,16 @@ class MiniCPMAligner:
                     "content": "Rewrite the same answer as valid JSON only. Do not add commentary.",
                 },
             ]
+            # Repair always uses the full token budget regardless of the original
+            # call's limit — a truncated response needs more room to be rewritten.
+            repair_max_tokens = int(self.config.get("caption_max_tokens", 450))
             repaired = self.model.chat(
                 image=None,
                 msgs=repair_messages,
                 tokenizer=self.tokenizer,
                 use_image_id=False,
                 max_slice_nums=effective_slices,
-                max_new_tokens=max_tokens,
+                max_new_tokens=repair_max_tokens,
             )
             return _extract_json(str(repaired))
 
