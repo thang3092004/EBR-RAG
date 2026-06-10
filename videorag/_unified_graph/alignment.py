@@ -4,6 +4,7 @@ import json
 import gc
 import re
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -131,10 +132,19 @@ Rewritten transcript:
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
+    start = text.find("{")
+    if start == -1:
         raise ValueError("MiniCPM response does not contain a JSON object.")
-    return json.loads(match.group(0))
+    obj, _ = json.JSONDecoder().raw_decode(text, start)
+    return obj
+
+
+def _load_frame_images(frame_paths: list[str]) -> list[Image.Image]:
+    return [
+        Image.open(path).convert("RGB")
+        for path in frame_paths
+        if Path(path).exists()
+    ]
 
 
 class MiniCPMAligner:
@@ -190,51 +200,85 @@ class MiniCPMAligner:
         )
         self.model.eval()
 
-    def align(self, prompt: str, frame_paths: list[str]) -> dict[str, Any]:
-        self.load()
-        images = [
-            Image.open(path).convert("RGB")
-            for path in frame_paths
-            if Path(path).exists()
-        ]
+    def _chat_with_images(
+        self,
+        prompt: str,
+        images: list[Image.Image],
+        *,
+        max_tokens: int,
+        max_slice_nums: int | None = None,
+    ) -> dict[str, Any]:
+        effective_slices = max_slice_nums if max_slice_nums is not None else int(
+            self.config.get("caption_max_slice_nums", 2)
+        )
+        content = images + [prompt]
+        messages = [{"role": "user", "content": content}]
+        response = self.model.chat(
+            image=None,
+            msgs=messages,
+            tokenizer=self.tokenizer,
+            use_image_id=False,
+            max_slice_nums=effective_slices,
+            max_new_tokens=max_tokens,
+        )
         try:
-            content = images + [prompt]
-            messages = [{"role": "user", "content": content}]
-            response = self.model.chat(
+            return _extract_json(str(response))
+        except (ValueError, json.JSONDecodeError):
+            repair_messages = [
+                *messages,
+                {"role": "assistant", "content": str(response)},
+                {
+                    "role": "user",
+                    "content": "Rewrite the same answer as valid JSON only. Do not add commentary.",
+                },
+            ]
+            repaired = self.model.chat(
                 image=None,
-                msgs=messages,
+                msgs=repair_messages,
                 tokenizer=self.tokenizer,
                 use_image_id=False,
-                max_slice_nums=int(self.config.get("caption_max_slice_nums", 2)),
-                max_new_tokens=int(self.config.get("caption_max_tokens", 450)),
+                max_slice_nums=effective_slices,
+                max_new_tokens=max_tokens,
             )
-            try:
-                return _extract_json(str(response))
-            except (ValueError, json.JSONDecodeError):
-                repair_messages = [
-                    *messages,
-                    {"role": "assistant", "content": str(response)},
-                    {
-                        "role": "user",
-                        "content": "Rewrite the same answer as valid JSON only. Do not add commentary.",
-                    },
-                ]
-                repaired = self.model.chat(
-                    image=None,
-                    msgs=repair_messages,
-                    tokenizer=self.tokenizer,
-                    use_image_id=False,
-                    max_slice_nums=int(
-                        self.config.get("caption_max_slice_nums", 2)
-                    ),
-                    max_new_tokens=int(
-                        self.config.get("caption_max_tokens", 450)
-                    ),
-                )
-                return _extract_json(str(repaired))
+            return _extract_json(str(repaired))
+
+    def align(
+        self,
+        prompt: str,
+        frame_paths: list[str],
+        *,
+        max_tokens: int | None = None,
+        max_slice_nums: int | None = None,
+    ) -> dict[str, Any]:
+        self.load()
+        effective = max_tokens if max_tokens is not None else int(
+            self.config.get("caption_max_tokens", 450)
+        )
+        images = _load_frame_images(frame_paths)
+        try:
+            return self._chat_with_images(
+                prompt, images, max_tokens=effective, max_slice_nums=max_slice_nums
+            )
         finally:
             for image in images:
                 image.close()
+
+    def align_preloaded(
+        self,
+        prompt: str,
+        images: list[Image.Image],
+        *,
+        max_tokens: int | None = None,
+        max_slice_nums: int | None = None,
+    ) -> dict[str, Any]:
+        """Run inference with already-loaded PIL Images. Caller is responsible for closing them."""
+        self.load()
+        effective = max_tokens if max_tokens is not None else int(
+            self.config.get("caption_max_tokens", 450)
+        )
+        return self._chat_with_images(
+            prompt, images, max_tokens=effective, max_slice_nums=max_slice_nums
+        )
 
     def close(self) -> None:
         if not self._owns_model:
@@ -379,7 +423,9 @@ def _validate_alignment(
     for edge in raw.get("edges", []):
         source = str(edge.get("source", "")).strip()
         target = str(edge.get("target", "")).strip()
-        predicate = str(edge.get("predicate", "")).strip().lower().replace(" ", "_")
+        predicate = (
+            str(edge.get("predicate", "")).strip().lower().replace(" ", "_")
+        )
         source_visual_only = source in visual_ids and source not in text_ids
         target_visual_only = target in visual_ids and target not in text_ids
         source_text_only = source in text_ids and source not in visual_ids
@@ -509,6 +555,7 @@ def align_all_segments(
 ) -> dict[str, Any]:
     checkpoint_path = Path(checkpoint_dir)
     checkpoint_path.mkdir(parents=True, exist_ok=True)
+
     state_path = checkpoint_path / "alignment_state.json"
     state = read_json(state_path, {})
     registry = (
@@ -520,16 +567,18 @@ def align_all_segments(
     long_term_state = dict(state.get("long_term_state", {}))
     next_index = int(state.get("next_index", 0))
     edge_counter = int(state.get("edge_counter", 0))
+
     aligner = aligner or MiniCPMAligner(config)
-    crossmodal_enabled = not bool(
-        config.get("disable_crossmodal_alignment", False)
-    )
-    owns_correspondence_encoder = (
-        crossmodal_enabled and correspondence_encoder is None
-    )
+    crossmodal_enabled = not bool(config.get("disable_crossmodal_alignment", False))
+    owns_correspondence_encoder = crossmodal_enabled and correspondence_encoder is None
     if owns_correspondence_encoder:
         correspondence_encoder = OpenCLIPTextEncoder(config)
 
+    visual_max_tokens = int(config.get("caption_visual_max_tokens", 200))
+    visual_slice_nums = int(config.get("caption_visual_slice_nums", 1))
+    alignment_max_tokens = int(config.get("caption_max_tokens", 450))
+
+    # load already-completed alignment results
     results: dict[str, dict[str, Any]] = {}
     for previous_index in range(next_index):
         segment_id = segments[previous_index]["segment_id"]
@@ -537,362 +586,474 @@ def align_all_segments(
         if previous:
             results[segment_id] = previous
 
-    for index, segment in enumerate(segments[next_index:], start=next_index):
-        segment_id = str(segment["segment_id"])
-        text_result = text_results.get(
-            segment_id,
-            {"mentions": [], "rewritten_transcript": ""},
-        )
-        visible = _visible_entities(segment_id, observations)
-        raw_candidates, deterministic = _candidate_merges(
-            visible,
-            text_result.get("mentions", []),
-            registry,
-        )
-        if not crossmodal_enabled:
-            deterministic = {}
-        for text_id, global_id in deterministic.items():
-            mention = next(
-                item
-                for item in text_result["mentions"]
-                if item["text_id"] == text_id
-            )
-            registry.add_alias(
-                text_id,
-                global_id,
-                source="transcript",
-                label=mention["label"],
-                confidence=float(mention.get("confidence", 0.0)),
-                segment_id=segment_id,
-            )
-
-        prompt_mentions = []
-        for mention in text_result.get("mentions", []):
-            resolved = registry.resolve(mention["text_id"])
-            prompt_mentions.append(
-                {
-                    **mention,
-                    "text_id": resolved or mention["text_id"],
-                    **(
-                        {}
-                        if resolved
-                        else {"provisional_id": mention["text_id"]}
-                    ),
-                }
-            )
-        prompt_transcript = _rewrite_ids(
-            text_result.get("rewritten_transcript", ""),
-            registry,
-        )
-        transcript_memory = _rewrite_ids(
-            json.dumps(
-                text_result.get("memory_context", {}),
-                ensure_ascii=False,
-            ),
-            registry,
-        )
-        transcript_references = _rewrite_ids(
-            json.dumps(
-                text_result.get("references", []),
-                ensure_ascii=False,
-            ),
-            registry,
-        )
-        entity_state = [
-            {
-                "entity_id": node.entity_id,
-                "name": node.canonical_name,
-                "type": node.entity_type,
-                "last_seen": node.last_seen,
-                "recent_relations": long_term_state.get(
-                    node.entity_id,
-                    [],
-                )[-3:],
-            }
-            for node in registry.entities.values()
-            if node.last_seen is None
-            or node.last_seen >= float(segment["start"]) - 120.0
-        ][-20:]
-        frames = [
+    def _frame_paths(seg: dict[str, Any]) -> list[str]:
+        return [
             item["path"]
-            for item in frame_selections.get(segment_id, {}).get("frames", [])
+            for item in frame_selections.get(
+                str(seg["segment_id"]), {}
+            ).get("frames", [])
         ]
-        visual_prompt = VISUAL_FACT_PROMPT.format(
-            segment_id=segment_id,
-            start=float(segment["start"]),
-            end=float(segment["end"]),
-            visual_entities=json.dumps(visible, ensure_ascii=False),
-        )
-        raw_visual_analysis = (
-            aligner.align(visual_prompt, frames)
-            if visible and frames
-            else {}
-        )
-        visual_analysis = _validate_visual_analysis(
-            raw_visual_analysis,
-            visible,
-        )
-        facts = visual_facts(visual_analysis)
-        propositions = transcript_propositions(text_result, segment_id)
-        threshold = float(
-            config.get("correspondence_similarity_threshold", 0.28)
-        )
-        margin = float(
-            config.get("correspondence_similarity_margin", 0.04)
-        )
-        if (
-            crossmodal_enabled
-            and raw_candidates
-            and facts
-            and propositions
-            and correspondence_encoder is not None
-        ):
-            candidates, correspondence = gate_merge_candidates(
-                raw_candidates,
-                facts,
-                propositions,
-                correspondence_encoder.encode,
-                threshold=threshold,
-                margin=margin,
-            )
-        elif not crossmodal_enabled:
-            candidates = []
-            correspondence = {
-                "status": "disabled_by_ablation",
-                "threshold": threshold,
-                "margin": margin,
-                "pairs": [],
-            }
-        else:
-            candidates = []
-            correspondence = {
-                "status": "no_correspondence_evidence",
-                "threshold": threshold,
-                "margin": margin,
-                "pairs": [],
-            }
-        prompt_propositions = [
-            {
-                **proposition,
-                "text": _rewrite_ids(proposition["text"], registry),
-                "entity_ids": [
-                    registry.resolve(entity_id) or entity_id
-                    for entity_id in proposition.get("entity_ids", [])
-                ],
-            }
-            for proposition in propositions
-        ]
-        prompt = ALIGNMENT_PROMPT.format(
-            segment_id=segment_id,
-            start=float(segment["start"]),
-            end=float(segment["end"]),
-            visual_entities=json.dumps(visible, ensure_ascii=False),
-            text_entities=json.dumps(
-                prompt_mentions, ensure_ascii=False
-            ),
-            merge_candidates=json.dumps(candidates, ensure_ascii=False),
-            visual_facts=json.dumps(facts, ensure_ascii=False),
-            transcript_propositions=json.dumps(
-                prompt_propositions,
-                ensure_ascii=False,
-            ),
-            recent_memory=json.dumps(recent_events[-8:], ensure_ascii=False),
-            entity_state=json.dumps(entity_state, ensure_ascii=False),
-            transcript_memory=transcript_memory,
-            transcript_references=transcript_references,
-            transcript=prompt_transcript,
-        )
-        raw_alignment = aligner.align(prompt, frames)
-        text_ids = {
-            str(mention["text_id"])
-            for mention in text_result.get("mentions", [])
-        }
-        text_ids.update(
-            str(mention["text_id"])
-            for mention in prompt_mentions
-        )
-        alignment = _validate_alignment(
-            raw_alignment,
-            candidates,
-            visual_ids={
-                str(entity["entity_id"])
-                for entity in visible
-            },
-            text_ids=text_ids,
-        )
-        alignment["edges"] = _deduplicate_edges(
-            visual_analysis["visual_edges"] + alignment["edges"]
-        )
 
-        for merge in alignment["entity_merges"]:
-            mention = next(
-                item
-                for item in text_result["mentions"]
-                if item["text_id"] == merge["text_id"]
+    # -----------------------------------------------------------------
+    # PASS 1 — Visual captioning (stateless, prefetch frames)
+    # visual_pass.json caches results so resume and ablation reuse work.
+    # -----------------------------------------------------------------
+    visual_pass_path = checkpoint_path / "visual_pass.json"
+    visual_pass: dict[str, dict[str, Any]] = dict(read_json(visual_pass_path, {}))
+
+    segments_needing_visual = [
+        seg for seg in segments
+        if str(seg["segment_id"]) not in visual_pass
+        and str(seg["segment_id"]) not in results
+    ]
+
+    if segments_needing_visual:
+        aligner.load()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            next_future: Future[list[Image.Image]] = executor.submit(
+                _load_frame_images, _frame_paths(segments_needing_visual[0])
             )
-            registry.add_alias(
-                merge["text_id"],
-                merge["visual_id"],
-                source="transcript",
-                label=mention["label"],
-                confidence=float(mention.get("confidence", 0.0)),
-                segment_id=segment_id,
+            next_prefetch_id = str(segments_needing_visual[0]["segment_id"])
+
+            for vi, segment in enumerate(segments_needing_visual):
+                segment_id = str(segment["segment_id"])
+                visible = _visible_entities(segment_id, observations)
+
+                images = (
+                    next_future.result()
+                    if next_prefetch_id == segment_id
+                    else _load_frame_images(_frame_paths(segment))
+                )
+
+                # kick off prefetch for next segment before GPU work starts
+                if vi + 1 < len(segments_needing_visual):
+                    nxt = segments_needing_visual[vi + 1]
+                    next_prefetch_id = str(nxt["segment_id"])
+                    next_future = executor.submit(_load_frame_images, _frame_paths(nxt))
+
+                try:
+                    if visible and images:
+                        visual_prompt = VISUAL_FACT_PROMPT.format(
+                            segment_id=segment_id,
+                            start=float(segment["start"]),
+                            end=float(segment["end"]),
+                            visual_entities=json.dumps(visible, ensure_ascii=False),
+                        )
+                        raw_visual = aligner.align_preloaded(
+                            visual_prompt,
+                            images,
+                            max_tokens=visual_max_tokens,
+                            max_slice_nums=visual_slice_nums,
+                        )
+                        visual_analysis = _validate_visual_analysis(raw_visual, visible)
+                    else:
+                        visual_analysis = {
+                            "visual_caption": "",
+                            "entity_descriptions": [],
+                            "visual_edges": [],
+                        }
+                finally:
+                    for img in images:
+                        img.close()
+
+                visual_pass[segment_id] = visual_analysis
+                atomic_write_json(visual_pass_path, visual_pass)
+
+    # -----------------------------------------------------------------
+    # PASS 2 — Alignment (stateful, memory-aware, prefetch frames)
+    # OpenCLIP runs inline here so registry stays progressive across
+    # segments (deterministic merges from earlier segs inform later ones).
+    # Frame prefetch overlaps with the OpenCLIP + CPU work before each
+    # MiniCPM call.
+    # -----------------------------------------------------------------
+    remaining_segments = segments[next_index:]
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        next_future_p2: Future[list[Image.Image]] | None = None
+        next_prefetch_id_p2: str | None = None
+
+        if remaining_segments:
+            next_future_p2 = executor.submit(
+                _load_frame_images, _frame_paths(remaining_segments[0])
+            )
+            next_prefetch_id_p2 = str(remaining_segments[0]["segment_id"])
+
+        for index, segment in enumerate(remaining_segments, start=next_index):
+            segment_id = str(segment["segment_id"])
+            local_idx = index - next_index
+
+            text_result = text_results.get(
+                segment_id,
+                {"mentions": [], "rewritten_transcript": ""},
+            )
+            visible = _visible_entities(segment_id, observations)
+            visual_analysis = visual_pass.get(
+                segment_id,
+                {"visual_caption": "", "entity_descriptions": [], "visual_edges": []},
             )
 
-        for mention in text_result.get("mentions", []):
-            global_id = registry.resolve(mention["text_id"])
-            if not global_id:
-                global_id = registry.ensure_entity(
-                    mention["entity_type"],
-                    mention["label"],
-                    source="transcript",
-                    confidence=float(mention.get("confidence", 0.0)),
+            # collect pre-fetched frames
+            align_images = (
+                next_future_p2.result()
+                if next_future_p2 is not None and next_prefetch_id_p2 == segment_id
+                else _load_frame_images(_frame_paths(segment))
+            )
+
+            # kick off prefetch for next segment before OpenCLIP/CPU work
+            if local_idx + 1 < len(remaining_segments):
+                nxt = remaining_segments[local_idx + 1]
+                next_prefetch_id_p2 = str(nxt["segment_id"])
+                next_future_p2 = executor.submit(_load_frame_images, _frame_paths(nxt))
+            else:
+                next_future_p2 = None
+
+            # candidate merges use live registry for progressive deterministic resolution
+            raw_candidates, deterministic = _candidate_merges(
+                visible,
+                text_result.get("mentions", []),
+                registry,
+            )
+            if not crossmodal_enabled:
+                deterministic = {}
+            for text_id, global_id in deterministic.items():
+                mention = next(
+                    item
+                    for item in text_result["mentions"]
+                    if item["text_id"] == text_id
                 )
                 registry.add_alias(
-                    mention["text_id"],
+                    text_id,
                     global_id,
                     source="transcript",
                     label=mention["label"],
                     confidence=float(mention.get("confidence", 0.0)),
                     segment_id=segment_id,
                 )
-            occurrences = mention.get("occurrences") or [
-                {
-                    "start": mention["start"],
-                    "end": mention["end"],
-                    "text": mention["label"],
-                    "confidence": mention.get("confidence", 0.0),
-                }
-            ]
-            for occurrence in occurrences:
-                registry.add_provenance(
-                    global_id,
-                    ProvenanceRecord(
-                        source="transcript",
-                        video_id=video_id,
-                        segment_id=segment_id,
-                        start=float(occurrence["start"]),
-                        end=float(occurrence["end"]),
-                        text=str(occurrence.get("text", mention["label"])),
-                        confidence=float(
-                            occurrence.get(
-                                "confidence",
-                                mention.get("confidence", 0.0),
-                            )
-                        ),
-                    ),
-                )
 
-        edges: list[dict[str, Any]] = []
-        for raw_edge in alignment["edges"]:
-            source = registry.resolve(raw_edge["source"])
-            target = registry.resolve(raw_edge["target"])
-            if not source or not target:
-                continue
-            edge_counter += 1
-            edge = EdgeOccurrence(
-                edge_id=_edge_id(video_id, edge_counter),
-                source_id=source,
-                target_id=target,
-                predicate=raw_edge["predicate"],
+            prompt_mentions = []
+            for mention in text_result.get("mentions", []):
+                resolved = registry.resolve(mention["text_id"])
+                prompt_mentions.append(
+                    {
+                        **mention,
+                        "text_id": resolved or mention["text_id"],
+                        **(
+                            {}
+                            if resolved
+                            else {"provisional_id": mention["text_id"]}
+                        ),
+                    }
+                )
+            prompt_transcript = _rewrite_ids(
+                text_result.get("rewritten_transcript", ""),
+                registry,
+            )
+            transcript_memory = _rewrite_ids(
+                json.dumps(
+                    text_result.get("memory_context", {}),
+                    ensure_ascii=False,
+                ),
+                registry,
+            )
+            transcript_references = _rewrite_ids(
+                json.dumps(
+                    text_result.get("references", []),
+                    ensure_ascii=False,
+                ),
+                registry,
+            )
+            entity_state = [
+                {
+                    "entity_id": node.entity_id,
+                    "name": node.canonical_name,
+                    "type": node.entity_type,
+                    "last_seen": node.last_seen,
+                    "recent_relations": long_term_state.get(
+                        node.entity_id,
+                        [],
+                    )[-3:],
+                }
+                for node in registry.entities.values()
+                if node.last_seen is None
+                or node.last_seen >= float(segment["start"]) - 120.0
+            ][-20:]
+
+            # OpenCLIP correspondence gate — runs while next frames are prefetching
+            facts = visual_facts(visual_analysis)
+            propositions = transcript_propositions(text_result, segment_id)
+            threshold = float(
+                config.get("correspondence_similarity_threshold", 0.28)
+            )
+            margin = float(
+                config.get("correspondence_similarity_margin", 0.04)
+            )
+            if (
+                crossmodal_enabled
+                and raw_candidates
+                and facts
+                and propositions
+                and correspondence_encoder is not None
+            ):
+                candidates, correspondence = gate_merge_candidates(
+                    raw_candidates,
+                    facts,
+                    propositions,
+                    correspondence_encoder.encode,
+                    threshold=threshold,
+                    margin=margin,
+                )
+            elif not crossmodal_enabled:
+                candidates = []
+                correspondence = {
+                    "status": "disabled_by_ablation",
+                    "threshold": threshold,
+                    "margin": margin,
+                    "pairs": [],
+                }
+            else:
+                candidates = []
+                correspondence = {
+                    "status": "no_correspondence_evidence",
+                    "threshold": threshold,
+                    "margin": margin,
+                    "pairs": [],
+                }
+
+            prompt_propositions = [
+                {
+                    **proposition,
+                    "text": _rewrite_ids(proposition["text"], registry),
+                    "entity_ids": [
+                        registry.resolve(entity_id) or entity_id
+                        for entity_id in proposition.get("entity_ids", [])
+                    ],
+                }
+                for proposition in propositions
+            ]
+            prompt = ALIGNMENT_PROMPT.format(
+                segment_id=segment_id,
                 start=float(segment["start"]),
                 end=float(segment["end"]),
-                segment_id=segment_id,
-                confidence=float(raw_edge["confidence"]),
-                modalities=raw_edge["modalities"],
-                provenance=[
-                    ProvenanceRecord(
-                        source=(
-                            "minicpm_visual"
-                            if raw_edge["modalities"] == ["visual"]
-                            else (
-                                "minicpm_transcript"
-                                if raw_edge["modalities"] == ["transcript"]
-                                else "minicpm_alignment"
-                            )
-                        ),
-                        video_id=video_id,
-                        segment_id=segment_id,
-                        start=float(segment["start"]),
-                        end=float(segment["end"]),
-                        confidence=float(raw_edge["confidence"]),
-                    )
-                ],
+                visual_entities=json.dumps(visible, ensure_ascii=False),
+                text_entities=json.dumps(
+                    prompt_mentions, ensure_ascii=False
+                ),
+                merge_candidates=json.dumps(candidates, ensure_ascii=False),
+                visual_facts=json.dumps(facts, ensure_ascii=False),
+                transcript_propositions=json.dumps(
+                    prompt_propositions,
+                    ensure_ascii=False,
+                ),
+                recent_memory=json.dumps(recent_events[-8:], ensure_ascii=False),
+                entity_state=json.dumps(entity_state, ensure_ascii=False),
+                transcript_memory=transcript_memory,
+                transcript_references=transcript_references,
+                transcript=prompt_transcript,
             )
-            edge_payload = edge.to_dict()
-            edge_payload["storage_id"] = segment.get(
-                "storage_id",
-                f"{video_id}_{segment.get('index', index)}",
-            )
-            edges.append(edge_payload)
 
-        caption = _rewrite_ids(alignment["caption"], registry)
-        rewritten_transcript = _rewrite_ids(
-            text_result.get("rewritten_transcript", ""),
-            registry,
-        )
-        recent_events.extend(
-            [
-                {
-                    "source": edge["source_id"],
+            # MiniCPM alignment — frames are pre-fetched and waiting
+            try:
+                raw_alignment = aligner.align_preloaded(
+                    prompt,
+                    align_images,
+                    max_tokens=alignment_max_tokens,
+                )
+            finally:
+                for img in align_images:
+                    img.close()
+
+            text_ids = {
+                str(mention["text_id"])
+                for mention in text_result.get("mentions", [])
+            }
+            text_ids.update(
+                str(mention["text_id"])
+                for mention in prompt_mentions
+            )
+            alignment = _validate_alignment(
+                raw_alignment,
+                candidates,
+                visual_ids={
+                    str(entity["entity_id"])
+                    for entity in visible
+                },
+                text_ids=text_ids,
+            )
+            alignment["edges"] = _deduplicate_edges(
+                visual_analysis["visual_edges"] + alignment["edges"]
+            )
+
+            for merge in alignment["entity_merges"]:
+                mention = next(
+                    item
+                    for item in text_result["mentions"]
+                    if item["text_id"] == merge["text_id"]
+                )
+                registry.add_alias(
+                    merge["text_id"],
+                    merge["visual_id"],
+                    source="transcript",
+                    label=mention["label"],
+                    confidence=float(mention.get("confidence", 0.0)),
+                    segment_id=segment_id,
+                )
+
+            for mention in text_result.get("mentions", []):
+                global_id = registry.resolve(mention["text_id"])
+                if not global_id:
+                    global_id = registry.ensure_entity(
+                        mention["entity_type"],
+                        mention["label"],
+                        source="transcript",
+                        confidence=float(mention.get("confidence", 0.0)),
+                    )
+                    registry.add_alias(
+                        mention["text_id"],
+                        global_id,
+                        source="transcript",
+                        label=mention["label"],
+                        confidence=float(mention.get("confidence", 0.0)),
+                        segment_id=segment_id,
+                    )
+                occurrences = mention.get("occurrences") or [
+                    {
+                        "start": mention["start"],
+                        "end": mention["end"],
+                        "text": mention["label"],
+                        "confidence": mention.get("confidence", 0.0),
+                    }
+                ]
+                for occurrence in occurrences:
+                    registry.add_provenance(
+                        global_id,
+                        ProvenanceRecord(
+                            source="transcript",
+                            video_id=video_id,
+                            segment_id=segment_id,
+                            start=float(occurrence["start"]),
+                            end=float(occurrence["end"]),
+                            text=str(occurrence.get("text", mention["label"])),
+                            confidence=float(
+                                occurrence.get(
+                                    "confidence",
+                                    mention.get("confidence", 0.0),
+                                )
+                            ),
+                        ),
+                    )
+
+            edges: list[dict[str, Any]] = []
+            for raw_edge in alignment["edges"]:
+                source = registry.resolve(raw_edge["source"])
+                target = registry.resolve(raw_edge["target"])
+                if not source or not target:
+                    continue
+                edge_counter += 1
+                edge = EdgeOccurrence(
+                    edge_id=_edge_id(video_id, edge_counter),
+                    source_id=source,
+                    target_id=target,
+                    predicate=raw_edge["predicate"],
+                    start=float(segment["start"]),
+                    end=float(segment["end"]),
+                    segment_id=segment_id,
+                    confidence=float(raw_edge["confidence"]),
+                    modalities=raw_edge["modalities"],
+                    provenance=[
+                        ProvenanceRecord(
+                            source=(
+                                "minicpm_visual"
+                                if raw_edge["modalities"] == ["visual"]
+                                else (
+                                    "minicpm_transcript"
+                                    if raw_edge["modalities"] == ["transcript"]
+                                    else "minicpm_alignment"
+                                )
+                            ),
+                            video_id=video_id,
+                            segment_id=segment_id,
+                            start=float(segment["start"]),
+                            end=float(segment["end"]),
+                            confidence=float(raw_edge["confidence"]),
+                        )
+                    ],
+                )
+                edge_payload = edge.to_dict()
+                edge_payload["storage_id"] = segment.get(
+                    "storage_id",
+                    f"{video_id}_{segment.get('index', index)}",
+                )
+                edges.append(edge_payload)
+
+            caption = _rewrite_ids(alignment["caption"], registry)
+            rewritten_transcript = _rewrite_ids(
+                text_result.get("rewritten_transcript", ""),
+                registry,
+            )
+            recent_events.extend(
+                [
+                    {
+                        "source": edge["source_id"],
+                        "predicate": edge["predicate"],
+                        "target": edge["target_id"],
+                        "segment_id": segment_id,
+                    }
+                    for edge in edges
+                ]
+            )
+            recent_events = recent_events[
+                -int(config.get("entity_memory_recent_events", 8)):
+            ]
+            memory_delta = []
+            for edge in edges:
+                relation = {
                     "predicate": edge["predicate"],
                     "target": edge["target_id"],
                     "segment_id": segment_id,
+                    "time": [edge["start"], edge["end"]],
                 }
-                for edge in edges
-            ]
-        )
-        recent_events = recent_events[-int(config.get("entity_memory_recent_events", 8)) :]
-        memory_delta = []
-        for edge in edges:
-            relation = {
-                "predicate": edge["predicate"],
-                "target": edge["target_id"],
+                long_term_state.setdefault(edge["source_id"], []).append(relation)
+                long_term_state[edge["source_id"]] = long_term_state[
+                    edge["source_id"]
+                ][-5:]
+                memory_delta.append(
+                    f"{edge['source_id']} {edge['predicate']} {edge['target_id']}"
+                )
+            segment_result = {
                 "segment_id": segment_id,
-                "time": [edge["start"], edge["end"]],
+                "caption": caption,
+                "rewritten_transcript": rewritten_transcript,
+                "edges": edges,
+                "accepted_merges": alignment["entity_merges"],
+                "candidate_merges": candidates,
+                "raw_candidate_merges": raw_candidates,
+                "correspondence": correspondence,
+                "visual_analysis": visual_analysis,
+                "transcript_propositions": propositions,
+                "frame_paths": _frame_paths(segment),
+                "memory_delta": memory_delta,
             }
-            long_term_state.setdefault(edge["source_id"], []).append(relation)
-            long_term_state[edge["source_id"]] = long_term_state[
-                edge["source_id"]
-            ][-5:]
-            memory_delta.append(
-                f"{edge['source_id']} {edge['predicate']} {edge['target_id']}"
+            atomic_write_json(checkpoint_path / f"{segment_id}.json", segment_result)
+            results[segment_id] = segment_result
+            atomic_write_json(
+                state_path,
+                {
+                    "next_index": index + 1,
+                    "edge_counter": edge_counter,
+                    "recent_events": recent_events,
+                    "long_term_state": long_term_state,
+                    "registry": registry.to_dict(),
+                },
             )
-        segment_result = {
-            "segment_id": segment_id,
-            "caption": caption,
-            "rewritten_transcript": rewritten_transcript,
-            "edges": edges,
-            "accepted_merges": alignment["entity_merges"],
-            "candidate_merges": candidates,
-            "raw_candidate_merges": raw_candidates,
-            "correspondence": correspondence,
-            "visual_analysis": visual_analysis,
-            "transcript_propositions": propositions,
-            "frame_paths": frames,
-            "memory_delta": memory_delta,
-        }
-        atomic_write_json(checkpoint_path / f"{segment_id}.json", segment_result)
-        results[segment_id] = segment_result
-        atomic_write_json(
-            state_path,
-            {
-                "next_index": index + 1,
-                "edge_counter": edge_counter,
-                "recent_events": recent_events,
-                "long_term_state": long_term_state,
-                "registry": registry.to_dict(),
-            },
-        )
-        if progress is not None:
-            progress.set(
-                index + 1,
-                entities=len(registry.entities),
-                edges=edge_counter,
-                correspondence=correspondence["status"],
-                gated_candidates=len(candidates),
-                accepted_merges=len(alignment["entity_merges"]),
-            )
+            if progress is not None:
+                progress.set(
+                    index + 1,
+                    entities=len(registry.entities),
+                    edges=edge_counter,
+                    correspondence=correspondence["status"],
+                    gated_candidates=len(candidates),
+                    accepted_merges=len(alignment["entity_merges"]),
+                )
 
     if owns_correspondence_encoder and correspondence_encoder is not None:
         correspondence_encoder.close()
