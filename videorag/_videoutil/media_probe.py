@@ -18,7 +18,30 @@ def _fraction(value: str | None, default: float = 0.0) -> float:
         return default
 
 
-def probe_video(video_path: str) -> dict[str, Any]:
+def _require_opencv_decode(path: str, duration: float) -> None:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError(
+            "Strict pipeline requires OpenCV video decoding."
+        ) from exc
+    capture = cv2.VideoCapture(path)
+    if not capture.isOpened():
+        raise RuntimeError(f"Strict pipeline cannot open video with OpenCV: {path}")
+    try:
+        for ratio in (0.0, 0.5, 0.95):
+            capture.set(cv2.CAP_PROP_POS_MSEC, duration * ratio * 1000.0)
+            ok, frame = capture.read()
+            if not ok or frame is None or frame.size == 0:
+                raise RuntimeError(
+                    f"Strict pipeline cannot decode video with OpenCV at "
+                    f"{ratio:.0%}: {path}"
+                )
+    finally:
+        capture.release()
+
+
+def probe_video(video_path: str, *, strict: bool = False) -> dict[str, Any]:
     """Return stable media metadata, preferring ffprobe and falling back to OpenCV."""
     path = str(Path(video_path).resolve())
     command = [
@@ -57,7 +80,7 @@ def probe_video(video_path: str) -> dict[str, Any]:
             or video_stream.get("r_frame_rate"),
             30.0,
         )
-        return {
+        result = {
             "path": path,
             "duration": duration,
             "fps": fps,
@@ -69,8 +92,18 @@ def probe_video(video_path: str) -> dict[str, Any]:
             "audio_codec": audio_stream.get("codec_name"),
             "probe_backend": "ffprobe",
         }
-    except (FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError):
-        pass
+        if strict:
+            _require_opencv_decode(path, duration)
+        return result
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+    ) as exc:
+        if strict:
+            raise RuntimeError(
+                f"Strict pipeline requires successful ffprobe metadata: {path}"
+            ) from exc
 
     try:
         import cv2
@@ -100,4 +133,3 @@ def probe_video(video_path: str) -> dict[str, Any]:
         "audio_codec": None,
         "probe_backend": "opencv",
     }
-

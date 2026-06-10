@@ -269,6 +269,7 @@ def _new_vrag(
         entity_tracking_fps=args.tracking_fps,
         spacy_model=args.spacy_model,
         pipeline_continue_on_error=args.continue_on_error,
+        pipeline_strict=args.strict_pipeline,
         keep_segment_cache=args.keep_segment_cache,
         **ingestion_profile_overrides(artifact_profile),
     )
@@ -477,6 +478,7 @@ def _ingest_profile(
     seed_report = {"status": "disabled", "seeded_videos": 0}
     if (
         args.reuse_full_artifacts
+        and not args.strict_pipeline
         and profile in REUSABLE_FULL_STAGES
         and not args.force
         and not args.no_resume
@@ -544,6 +546,11 @@ def _ingest_profile(
 
 def run_ingestion(dataset: dict, args) -> None:
     profiles = tuple(args.ingestion_profiles or DEFAULT_INGESTION_PROFILES)
+    if args.strict_pipeline and BASELINE_SCENARIO in profiles:
+        raise ValueError(
+            "--strict-pipeline applies to Unified V2 profiles only; select "
+            "full_framework and/or controlled unified ingestion profiles."
+        )
     invalid = [
         profile
         for profile in profiles
@@ -967,6 +974,15 @@ def _parse_args():
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--keep-segment-cache", action="store_true")
     parser.add_argument(
+        "--strict-pipeline",
+        action="store_true",
+        help=(
+            "Disable runtime fallbacks and cross-profile artifact reuse, "
+            "require local models, and stop on the first error. Completed "
+            "stages may still be resumed unless --no-resume is set."
+        ),
+    )
+    parser.add_argument(
         "--no-reuse-full-artifacts",
         dest="reuse_full_artifacts",
         action="store_false",
@@ -988,7 +1004,36 @@ def _parse_args():
 
 
 def main() -> None:
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env")
     args = _parse_args()
+    if args.strict_pipeline and args.continue_on_error:
+        raise ValueError(
+            "--strict-pipeline cannot be combined with --continue-on-error."
+        )
+    if args.strict_pipeline and args.restart_stage:
+        raise ValueError(
+            "--strict-pipeline cannot be combined with --restart-stage."
+        )
+    if (
+        args.strict_pipeline
+        and not Path(args.caption_model).expanduser().is_dir()
+    ):
+        raise FileNotFoundError(
+            "--strict-pipeline requires --caption-model to be a local directory: "
+            f"{args.caption_model}"
+        )
+    if args.strict_pipeline and not Path(args.asr_model).expanduser().is_dir():
+        raise FileNotFoundError(
+            "--strict-pipeline requires --asr-model to be a local directory: "
+            f"{args.asr_model}"
+        )
+    if args.strict_pipeline and not Path(args.tracking_model).expanduser().is_file():
+        raise FileNotFoundError(
+            "--strict-pipeline requires --tracking-model to be a local weights file: "
+            f"{args.tracking_model}"
+        )
     args.dataset = args.dataset.expanduser().resolve()
     args.video_root = args.video_root.expanduser().resolve()
     args.work_root = args.work_root.expanduser().resolve()

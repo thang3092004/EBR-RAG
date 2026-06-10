@@ -163,6 +163,18 @@ def run_chunked_tracking(
     *,
     progress=None,
 ) -> list[dict[str, Any]]:
+    if config.get("pipeline_strict", False):
+        try:
+            import lap
+        except ImportError as exc:
+            raise RuntimeError(
+                "Strict pipeline requires lap==0.5.13 before tracking; "
+                "runtime dependency installation is disabled."
+            ) from exc
+        if str(getattr(lap, "__version__", "")) != "0.5.13":
+            raise RuntimeError(
+                "Strict pipeline requires lap==0.5.13 before tracking."
+            )
     try:
         import cv2
         from ultralytics import YOLO
@@ -180,7 +192,13 @@ def run_chunked_tracking(
     target_fps = float(config.get("entity_tracking_fps", 3.0))
     chunk_seconds = float(config.get("tracking_chunk_seconds", 60.0))
     chunk_count = max(1, int(math.ceil(duration / chunk_seconds)))
-    model = YOLO(str(config.get("entity_tracking_model", "yolov8n.pt")))
+    model_path = str(config.get("entity_tracking_model", "yolov8n.pt"))
+    if config.get("pipeline_strict", False) and not Path(model_path).is_file():
+        raise FileNotFoundError(
+            "Strict pipeline requires a local YOLO weights file: "
+            f"{Path(model_path).resolve()}"
+        )
+    model = YOLO(model_path)
     capture = cv2.VideoCapture(video_path)
     all_observations = []
     for chunk_index in range(chunk_count):

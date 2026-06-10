@@ -15,15 +15,28 @@ def attach_openclip_embeddings(
         and Path(tracklet["representative_crop"]).exists()
     ]
     if not crop_items:
+        if config.get("pipeline_strict", False) and tracklets:
+            raise RuntimeError(
+                "Strict pipeline requires a representative crop for every "
+                "visual tracklet."
+            )
         return {"available": False, "reason": "no_representative_crops"}
     try:
         import open_clip
         import torch
         from PIL import Image
-    except ImportError:
+    except ImportError as exc:
+        if config.get("pipeline_strict", False):
+            raise RuntimeError(
+                "Strict pipeline requires OpenCLIP appearance embeddings."
+            ) from exc
         return {"available": False, "reason": "open_clip_not_installed"}
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if config.get("pipeline_strict", False) and device != "cuda":
+        raise RuntimeError(
+            "Strict pipeline requires CUDA for OpenCLIP appearance embeddings."
+        )
     model_name = str(config.get("openclip_model", "ViT-B-32"))
     pretrained = str(
         config.get("openclip_pretrained", "laion2b_s34b_b79k")

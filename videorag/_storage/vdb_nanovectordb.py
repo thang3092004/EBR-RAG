@@ -95,6 +95,20 @@ class NanoVectorDBVideoSegmentStorage(BaseVectorStorage):
 
         from .._videoutil.feature import encode_video_segments
 
+        checkpoint = os.path.join(".checkpoints", "imagebind_huge.pth")
+        if self.global_config.get("pipeline_strict", False):
+            if not os.path.isfile(checkpoint):
+                raise FileNotFoundError(
+                    "Strict pipeline requires local ImageBind weights: "
+                    f"{os.path.abspath(checkpoint)}"
+                )
+            if os.path.getsize(checkpoint) < 4_000_000_000:
+                raise RuntimeError(
+                    "Strict pipeline found a truncated ImageBind checkpoint: "
+                    f"{os.path.abspath(checkpoint)}"
+                )
+            if not torch.cuda.is_available():
+                raise RuntimeError("Strict pipeline requires CUDA for ImageBind.")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         embedder = imagebind_model.imagebind_huge(pretrained=True).to(device)
         embedder.eval()

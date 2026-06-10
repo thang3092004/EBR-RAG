@@ -156,6 +156,11 @@ def smart_segment(
                 previous[right] = left
 
     if previous[-1] is None:
+        if config.get("pipeline_strict", False):
+            raise RuntimeError(
+                "Strict pipeline could not find a valid adaptive segmentation "
+                "path; deterministic fixed-window fallback is disabled."
+            )
         # A deterministic hard fallback for pathological timestamp input.
         boundaries = [0.0]
         now = maximum

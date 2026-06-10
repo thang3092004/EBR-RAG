@@ -9,6 +9,7 @@ __pycache__/
 # --- Environments ---
 venv/
 .venv/
+.tools/
 ENV/
 .env
 .env.example-new

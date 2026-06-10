@@ -27,6 +27,8 @@ def _opencv_shots(
         raise RuntimeError("Shot detection fallback requires opencv-python.") from exc
 
     capture = cv2.VideoCapture(video_path)
+    if not capture.isOpened():
+        raise RuntimeError(f"OpenCV could not open video for shot detection: {video_path}")
     source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
     stride = max(1, int(round(source_fps / max(sample_fps, 0.1))))
     frame_index = 0
@@ -74,6 +76,10 @@ def _opencv_shots(
         if progress is not None:
             progress.set(min(timestamp, duration), shots=len(boundaries))
     capture.release()
+    if not samples:
+        raise RuntimeError(
+            f"OpenCV decoded zero frames for shot detection: {video_path}"
+        )
     return {
         "backend": "opencv_histogram",
         "boundaries": boundaries,
@@ -99,6 +105,11 @@ def detect_shots_and_motion(
         threshold,
         progress=progress,
     )
+    if config.get("pipeline_strict", False) and not result["samples"]:
+        raise RuntimeError(
+            "Strict pipeline requires decoded motion samples; zero-frame "
+            "shot analysis is invalid."
+        )
 
     try:
         from scenedetect import SceneManager, open_video
@@ -125,8 +136,12 @@ def detect_shots_and_motion(
             )
         result["backend"] = "pyscenedetect+opencv_metrics"
         result["boundaries"] = boundaries
-    except (ImportError, RuntimeError, OSError, ValueError):
-        pass
+    except (ImportError, RuntimeError, OSError, ValueError) as exc:
+        if config.get("pipeline_strict", False):
+            raise RuntimeError(
+                "Strict pipeline requires PySceneDetect; OpenCV-only shot "
+                "detection fallback is disabled."
+            ) from exc
 
     result["duration"] = duration
     result["sample_fps"] = sample_fps

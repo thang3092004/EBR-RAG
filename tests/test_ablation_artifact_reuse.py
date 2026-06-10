@@ -83,3 +83,54 @@ def test_profile_seed_rejects_stale_pipeline_version(tmp_path):
     assert report["seeded_videos"] == 0
     assert report["unavailable_videos"] == [video_id]
     assert not (target / "pipeline_v2" / video_id / "manifest.json").exists()
+
+
+def test_strict_profile_resumes_its_own_completed_stages(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import reproduce.run_ablation_matrix as ablation
+
+    collection = {"slug": "collection"}
+    workdir = tmp_path / "collection" / "full_framework"
+    workdir.mkdir(parents=True)
+    (workdir / "existing-artifact.json").write_text("{}", encoding="utf-8")
+    calls = {}
+
+    class FakeVideoRAG:
+        def insert_video(self, videos, *, resume, restart_stage, force):
+            calls.update(
+                videos=videos,
+                resume=resume,
+                restart_stage=restart_stage,
+                force=force,
+            )
+            return [{"status": "complete"}]
+
+    monkeypatch.setattr(
+        ablation,
+        "_new_vrag",
+        lambda *_args, **_kwargs: FakeVideoRAG(),
+    )
+    monkeypatch.setattr(
+        ablation,
+        "_collect_artifact_report",
+        lambda *_args, **_kwargs: {},
+    )
+    args = SimpleNamespace(
+        work_root=tmp_path,
+        strict_pipeline=True,
+        reuse_full_artifacts=False,
+        force=False,
+        no_resume=False,
+        restart_stage=None,
+    )
+
+    result = ablation._ingest_profile(
+        collection,
+        ["video.mp4"],
+        "full_framework",
+        args,
+    )
+
+    assert result["status"] == "complete"
+    assert calls["resume"] is True

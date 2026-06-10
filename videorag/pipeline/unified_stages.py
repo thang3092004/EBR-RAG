@@ -7,6 +7,7 @@ UNIFIED_STAGE_DEFINITIONS = [
     StageDefinition(
         "probe",
         config_keys=(
+            "pipeline_strict",
             "video_output_format",
             "audio_output_format",
             "input_path",
@@ -18,6 +19,7 @@ UNIFIED_STAGE_DEFINITIONS = [
         "asr",
         dependencies=("probe",),
         config_keys=(
+            "pipeline_strict",
             "asr_model",
             "asr_device",
             "asr_compute_type",
@@ -28,7 +30,11 @@ UNIFIED_STAGE_DEFINITIONS = [
     StageDefinition(
         "shot_detection",
         dependencies=("probe",),
-        config_keys=("shot_detector_threshold", "motion_sample_fps"),
+        config_keys=(
+            "pipeline_strict",
+            "shot_detector_threshold",
+            "motion_sample_fps",
+        ),
     ),
     StageDefinition(
         "segmentation",
@@ -40,6 +46,7 @@ UNIFIED_STAGE_DEFINITIONS = [
             "segment_min_seconds",
             "segment_max_seconds",
             "segment_context_seconds",
+            "pipeline_strict",
         ),
     ),
     StageDefinition(
@@ -54,6 +61,7 @@ UNIFIED_STAGE_DEFINITIONS = [
             "entity_tracking_imgsz",
             "tracking_chunk_seconds",
             "disable_visual_identity_linking",
+            "pipeline_strict",
         ),
     ),
     StageDefinition(
@@ -64,6 +72,7 @@ UNIFIED_STAGE_DEFINITIONS = [
             "frame_max",
             "frame_duplicate_threshold",
             "frame_marginal_gain_threshold",
+            "pipeline_strict",
         ),
     ),
     StageDefinition(
@@ -79,6 +88,7 @@ UNIFIED_STAGE_DEFINITIONS = [
             "text_reference_resolution_threshold",
             "text_reference_margin",
             "disable_transcript_memory",
+            "pipeline_strict",
         ),
     ),
     StageDefinition(
@@ -100,6 +110,7 @@ UNIFIED_STAGE_DEFINITIONS = [
             "correspondence_embedding_batch_size",
             "correspondence_device",
             "disable_crossmodal_alignment",
+            "pipeline_strict",
         ),
     ),
     StageDefinition(
@@ -111,6 +122,7 @@ UNIFIED_STAGE_DEFINITIONS = [
         "embedding_index",
         dependencies=("graph_build",),
         config_keys=(
+            "pipeline_strict",
             "video_embedding_batch_num",
             "video_embedding_dim",
         ),

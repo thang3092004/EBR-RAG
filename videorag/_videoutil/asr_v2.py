@@ -25,17 +25,28 @@ def transcribe_full_video(
             "Full-video ASR requires torch and faster-whisper."
         ) from exc
 
-    configured_model = config.get(
+    configured_model = str(config.get(
         "asr_model",
         config.get("whisper_model", "Systran/faster-distil-whisper-large-v3"),
-    )
+    ))
     local_model = os.path.abspath("./faster-distil-whisper-large-v3")
-    model_name = local_model if os.path.exists(local_model) else configured_model
+    if config.get("pipeline_strict", False):
+        configured_path = os.path.abspath(configured_model)
+        if not os.path.isdir(configured_path):
+            raise FileNotFoundError(
+                "Strict pipeline requires a local faster-whisper model "
+                f"directory: {configured_path}"
+            )
+        model_name = configured_path
+    else:
+        model_name = local_model if os.path.exists(local_model) else configured_model
     requested_device = str(config.get("asr_device", "auto"))
     if requested_device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = requested_device
+    if config.get("pipeline_strict", False) and device != "cuda":
+        raise RuntimeError("Strict pipeline requires CUDA for full-video ASR.")
     compute_type = str(
         config.get("asr_compute_type") or _default_compute_type(device)
     )

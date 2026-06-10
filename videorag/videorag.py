@@ -163,6 +163,7 @@ class VideoRAG:
     graph_allow_provisional_nodes: bool = False
     keep_segment_cache: bool = False
     pipeline_continue_on_error: bool = False
+    pipeline_strict: bool = False
     
     # query
     retrieval_topk_chunks: int = 8 # Ablation: Tweak baseline to 8
@@ -215,6 +216,11 @@ class VideoRAG:
         if not debug:
             model_path = os.path.abspath(self.caption_model_path)
             if not os.path.exists(model_path):
+                if self.pipeline_strict:
+                    raise FileNotFoundError(
+                        "Strict pipeline requires a local MiniCPM model directory: "
+                        f"{model_path}"
+                    )
                 model_path = "openbmb/MiniCPM-V-2_6-int4"
             self.caption_model = AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="cuda", attn_implementation="sdpa")
             self.caption_tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)

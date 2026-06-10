@@ -40,12 +40,21 @@ POSSESSOR_DEPS = {"poss"}
 def _load_nlp(config: dict[str, Any]):
     try:
         import spacy
-    except ImportError:
+    except ImportError as exc:
+        if config.get("pipeline_strict", False):
+            raise RuntimeError(
+                "Strict pipeline requires spaCy and the configured model."
+            ) from exc
         return None, "regex_fallback"
     model_name = str(config.get("spacy_model", "en_core_web_trf"))
     try:
         return spacy.load(model_name), model_name
-    except OSError:
+    except OSError as exc:
+        if config.get("pipeline_strict", False):
+            raise RuntimeError(
+                "Strict pipeline requires the configured spaCy model without "
+                f"fallback: {model_name}"
+            ) from exc
         try:
             return spacy.load("en_core_web_sm"), "en_core_web_sm"
         except OSError:

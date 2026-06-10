@@ -335,7 +335,10 @@ class UnifiedIngestPipeline:
         return read_json(runner.report_path, {})
 
     def _stage_probe(self, context, video_path: str) -> dict[str, Any]:
-        probe = probe_video(video_path)
+        probe = probe_video(
+            video_path,
+            strict=bool(self.config.get("pipeline_strict", False)),
+        )
         context.write_json("probe.json", probe)
         context.report_metrics(**probe)
         context.log(
@@ -352,6 +355,10 @@ class UnifiedIngestPipeline:
             description="ASR full video",
         ) as progress:
             if probe.get("has_audio") is False:
+                if self.config.get("pipeline_strict", False):
+                    raise RuntimeError(
+                        "Strict pipeline requires an audio stream for ASR."
+                    )
                 result = {
                     "model": "none",
                     "device": "none",
@@ -484,6 +491,19 @@ class UnifiedIngestPipeline:
             )
         tracklets = build_visual_tracklets(observations)
         embedding_report = attach_openclip_embeddings(tracklets, self.config)
+        if (
+            self.config.get("pipeline_strict", False)
+            and tracklets
+            and (
+                not embedding_report.get("available")
+                or int(embedding_report.get("embedded_tracklets", 0))
+                != len(tracklets)
+            )
+        ):
+            raise RuntimeError(
+                "Strict pipeline requires OpenCLIP embeddings for every "
+                "visual tracklet."
+            )
         registry = _new_video_registry(self.vrag.working_dir)
         visual_entities = link_visual_tracklets(
             tracklets,
@@ -872,7 +892,10 @@ class UnifiedIngestPipeline:
                 )
                 segment_index2name[str(segment["index"])] = name
                 clip_path = cache_dir / f"{name}.{self.vrag.video_output_format}"
-                if not clip_path.exists():
+                if (
+                    self.config.get("pipeline_strict", False)
+                    or not clip_path.exists()
+                ):
                     _extract_clip(
                         probe["path"],
                         clip_path,

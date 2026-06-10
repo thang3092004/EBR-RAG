@@ -6,3 +6,4 @@ scenedetect[opencv]>=0.6.4
 open_clip_torch>=2.26
 spacy>=3.7,<3.9
 Pillow>=10
+lap==0.5.13

@@ -139,6 +139,11 @@ def select_segment_frames(
         )
     capture.release()
     if not candidates:
+        if config.get("pipeline_strict", False):
+            raise RuntimeError(
+                f"Strict pipeline could not decode any frame for "
+                f"{segment['segment_id']}."
+            )
         return {"frames": [], "embedding_backend": "opencv_histogram"}
 
     qualities = np.asarray([item["quality"] for item in candidates], dtype=np.float32)
@@ -220,7 +225,15 @@ def select_segment_frames(
         filename = f"{segment['segment_id']}_{index:02d}_{item['time']:.3f}.jpg"
         frame_path = output_path / filename
         overlay = _draw_overlay(item["frame"], item["time"], observations, cv2)
-        cv2.imwrite(str(frame_path), overlay, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        written = cv2.imwrite(
+            str(frame_path),
+            overlay,
+            [cv2.IMWRITE_JPEG_QUALITY, 88],
+        )
+        if config.get("pipeline_strict", False) and not written:
+            raise RuntimeError(
+                f"Strict pipeline failed to write selected frame: {frame_path}"
+            )
         serialized.append(
             {
                 "time": item["time"],
@@ -228,6 +241,11 @@ def select_segment_frames(
                 "quality": item["quality"],
                 "entities": sorted(item["entities"]),
             }
+        )
+    if config.get("pipeline_strict", False) and len(serialized) < minimum:
+        raise RuntimeError(
+            f"Strict pipeline selected {len(serialized)} frames for "
+            f"{segment['segment_id']}; required at least {minimum}."
         )
     return {
         "frames": serialized,

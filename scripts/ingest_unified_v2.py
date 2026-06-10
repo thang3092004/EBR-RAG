@@ -58,7 +58,19 @@ def _gpu_report() -> dict:
         return {"cuda_available": False, "reason": "torch_not_installed"}
 
 
+def _require_empty_workdir(path: str) -> None:
+    workdir = Path(path).expanduser()
+    if workdir.exists() and any(workdir.iterdir()):
+        raise FileExistsError(
+            "Strict pipeline requires a new or empty workdir so no artifact "
+            f"can be reused: {workdir.resolve()}"
+        )
+
+
 def main() -> None:
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env")
     parser = argparse.ArgumentParser(
         description="Resume-safe Unified Multimodal Graph V2 ingestion."
     )
@@ -91,8 +103,38 @@ def main() -> None:
         help="Controlled ingestion ablation profile.",
     )
     parser.add_argument("--keep-segment-cache", action="store_true")
+    parser.add_argument(
+        "--strict-pipeline",
+        action="store_true",
+        help=(
+            "Disable runtime fallbacks, disable resume, require local MiniCPM, "
+            "and stop on the first error."
+        ),
+    )
     args = parser.parse_args()
 
+    if args.strict_pipeline and args.continue_on_error:
+        parser.error("--strict-pipeline cannot be combined with --continue-on-error.")
+    if args.strict_pipeline and args.restart_stage:
+        parser.error("--strict-pipeline cannot be combined with --restart-stage.")
+    if args.strict_pipeline and not Path(args.caption_model).expanduser().is_dir():
+        parser.error(
+            "--strict-pipeline requires --caption-model to be a local directory."
+        )
+    if args.strict_pipeline and not Path(args.asr_model).expanduser().is_dir():
+        parser.error(
+            "--strict-pipeline requires --asr-model to be a local directory."
+        )
+    if args.strict_pipeline and not Path(args.tracking_model).expanduser().is_file():
+        parser.error(
+            "--strict-pipeline requires --tracking-model to be a local weights file."
+        )
+    if args.strict_pipeline:
+        try:
+            _require_empty_workdir(args.workdir)
+        except FileExistsError as exc:
+            parser.error(str(exc))
+    resume = not (args.no_resume or args.strict_pipeline)
     videos = _videos(args)
     if not videos:
         parser.error("Provide at least one --video or --video-dir.")
@@ -108,7 +150,8 @@ def main() -> None:
         "pipeline": PIPELINE_VERSION,
         "workdir": str(Path(args.workdir).resolve()),
         "videos": videos,
-        "resume": not args.no_resume,
+        "resume": resume,
+        "strict_pipeline": args.strict_pipeline,
         "profile": args.profile,
         "restart_stage": args.restart_stage,
         "force": args.force,
@@ -141,11 +184,12 @@ def main() -> None:
         spacy_model=args.spacy_model,
         keep_segment_cache=args.keep_segment_cache,
         pipeline_continue_on_error=args.continue_on_error,
+        pipeline_strict=args.strict_pipeline,
         **profile_overrides,
     )
     reports = vrag.insert_video(
         videos,
-        resume=not args.no_resume,
+        resume=resume,
         restart_stage=args.restart_stage,
         force=args.force,
     )

@@ -258,6 +258,10 @@ class OpenCLIPTextEncoder:
             if configured == "auto" and torch.cuda.is_available()
             else ("cpu" if configured == "auto" else configured)
         )
+        if self.config.get("pipeline_strict", False) and self.device != "cuda":
+            raise RuntimeError(
+                "Strict pipeline requires CUDA for OpenCLIP correspondence."
+            )
         model_name = str(self.config.get("openclip_model", "ViT-B-32"))
         pretrained = str(
             self.config.get("openclip_pretrained", "laion2b_s34b_b79k")

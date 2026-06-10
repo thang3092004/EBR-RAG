@@ -164,6 +164,11 @@ class MiniCPMAligner:
                 "MiniCPM alignment requires torch and transformers."
             ) from exc
         model_path = Path(self.model_path)
+        if self.config.get("pipeline_strict", False) and not model_path.is_dir():
+            raise FileNotFoundError(
+                "Strict pipeline requires a local MiniCPM model directory: "
+                f"{model_path.resolve()}"
+            )
         resolved = (
             str(model_path.resolve())
             if model_path.exists()
