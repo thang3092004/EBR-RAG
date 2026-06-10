@@ -243,7 +243,13 @@ class MiniCPMAligner:
                 max_slice_nums=effective_slices,
                 max_new_tokens=repair_max_tokens,
             )
-            return _extract_json(str(repaired))
+            try:
+                return _extract_json(str(repaired))
+            except (ValueError, json.JSONDecodeError):
+                # Model could not produce valid JSON even after repair; return
+                # an empty dict so the segment is skipped gracefully rather
+                # than crashing the whole pipeline.
+                return {}
 
     def align(
         self,
