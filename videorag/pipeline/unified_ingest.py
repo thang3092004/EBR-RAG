@@ -490,6 +490,16 @@ class UnifiedIngestPipeline:
                 progress=progress,
             )
         tracklets = build_visual_tracklets(observations)
+        if (
+            self.config.get("pipeline_strict", False)
+            and not self.config.get("disable_visual_identity_linking", False)
+            and len(observations) == 0
+        ):
+            raise RuntimeError(
+                "Strict pipeline: tracking_base produced 0 observations for "
+                f"{video_id}. Check YOLO model path, video codec compatibility, "
+                "and that chunk checkpoint files are not stale empty lists."
+            )
         embedding_report = attach_openclip_embeddings(tracklets, self.config)
         if (
             self.config.get("pipeline_strict", False)

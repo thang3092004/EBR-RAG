@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util as _iutil
 import json
 import gc
 import re
@@ -7,6 +8,16 @@ from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
+
+from tqdm import tqdm
+
+
+def _detect_attn_impl() -> str:
+    """Return 'flash_attention_2' if real flash-attn (.so) is available, else 'sdpa'."""
+    spec = _iutil.find_spec("flash_attn")
+    if spec is not None and spec.origin is not None:
+        return "flash_attention_2"
+    return "sdpa"
 
 from PIL import Image
 
@@ -191,7 +202,7 @@ class MiniCPMAligner:
             torch_dtype=torch.bfloat16,
             device_map=device_map,
             attn_implementation=str(
-                self.config.get("caption_attention", "sdpa")
+                self.config.get("caption_attention", _detect_attn_impl())
             ),
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -250,6 +261,53 @@ class MiniCPMAligner:
                 # an empty dict so the segment is skipped gracefully rather
                 # than crashing the whole pipeline.
                 return {}
+
+    def _chat_batch(
+        self,
+        prompts: list[str],
+        images_list: list[list[Image.Image]],
+        *,
+        max_tokens: int,
+        max_slice_nums: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run one MiniCPM batch call for multiple segments simultaneously.
+
+        MiniCPM batch mode is triggered when msgs is a list-of-lists.
+        Images must be embedded in message content; image=None is required.
+        Returns one result dict per input (empty dict on unrecoverable failure).
+        Caller is responsible for closing all PIL Images after this returns.
+        """
+        effective_slices = max_slice_nums if max_slice_nums is not None else int(
+            self.config.get("caption_max_slice_nums", 2)
+        )
+        # Batch format: outer list = batch items, inner list = conversation turns
+        msgs = [
+            [{"role": "user", "content": imgs + [prompt]}]
+            for imgs, prompt in zip(images_list, prompts)
+        ]
+        responses = self.model.chat(
+            image=None,
+            msgs=msgs,
+            tokenizer=self.tokenizer,
+            use_image_id=False,
+            max_slice_nums=effective_slices,
+            max_new_tokens=max_tokens,
+        )
+        results: list[dict[str, Any]] = []
+        for i, response in enumerate(responses):
+            try:
+                results.append(_extract_json(str(response)))
+            except (ValueError, json.JSONDecodeError):
+                # Single-item repair for this batch item (images still alive)
+                results.append(
+                    self._chat_with_images(
+                        prompts[i],
+                        images_list[i],
+                        max_tokens=max_tokens,
+                        max_slice_nums=max_slice_nums,
+                    )
+                )
+        return results
 
     def align(
         self,
@@ -618,54 +676,100 @@ def align_all_segments(
 
     if segments_needing_visual:
         aligner.load()
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            next_future: Future[list[Image.Image]] = executor.submit(
-                _load_frame_images, _frame_paths(segments_needing_visual[0])
-            )
-            next_prefetch_id = str(segments_needing_visual[0]["segment_id"])
+        batch_size = int(config.get("caption_visual_batch_size", 4))
+        # Group segments into batches for parallel GPU processing.
+        # VRAM budget at batch_size=4: ~4.6 GB extra vs ~10 GB headroom (RTX 3090).
+        batches = [
+            segments_needing_visual[i : i + batch_size]
+            for i in range(0, len(segments_needing_visual), batch_size)
+        ]
+        n_already_done = len(segments) - len(segments_needing_visual)
+        with (
+            tqdm(
+                total=len(segments),
+                initial=n_already_done,
+                unit="seg",
+                desc=f"[{video_id}] visual caption (pass 1)",
+                dynamic_ncols=True,
+            ) as vbar,
+            ThreadPoolExecutor(max_workers=batch_size) as executor,
+        ):
+            # Prefetch first batch's frames in parallel before GPU work starts
+            pending_futures: list[Future[list[Image.Image]]] = [
+                executor.submit(_load_frame_images, _frame_paths(seg))
+                for seg in batches[0]
+            ]
 
-            for vi, segment in enumerate(segments_needing_visual):
-                segment_id = str(segment["segment_id"])
-                visible = _visible_entities(segment_id, observations)
+            for bi, batch in enumerate(batches):
+                # Collect prefetched images for this batch
+                batch_images: list[list[Image.Image]] = [
+                    f.result() for f in pending_futures
+                ]
 
-                images = (
-                    next_future.result()
-                    if next_prefetch_id == segment_id
-                    else _load_frame_images(_frame_paths(segment))
-                )
+                # Kick off prefetch for next batch before GPU call begins
+                if bi + 1 < len(batches):
+                    pending_futures = [
+                        executor.submit(_load_frame_images, _frame_paths(seg))
+                        for seg in batches[bi + 1]
+                    ]
+                else:
+                    pending_futures = []
 
-                # kick off prefetch for next segment before GPU work starts
-                if vi + 1 < len(segments_needing_visual):
-                    nxt = segments_needing_visual[vi + 1]
-                    next_prefetch_id = str(nxt["segment_id"])
-                    next_future = executor.submit(_load_frame_images, _frame_paths(nxt))
+                # Separate segments that need MiniCPM from those that can be skipped
+                active_idx: list[int] = []
+                active_prompts: list[str] = []
+                active_visible: list[list[dict[str, Any]]] = []
 
-                try:
+                for local_i, (seg, images) in enumerate(zip(batch, batch_images)):
+                    segment_id = str(seg["segment_id"])
+                    visible = _visible_entities(segment_id, observations)
                     if visible and images:
-                        visual_prompt = VISUAL_FACT_PROMPT.format(
-                            segment_id=segment_id,
-                            start=float(segment["start"]),
-                            end=float(segment["end"]),
-                            visual_entities=json.dumps(visible, ensure_ascii=False),
+                        active_idx.append(local_i)
+                        active_visible.append(visible)
+                        active_prompts.append(
+                            VISUAL_FACT_PROMPT.format(
+                                segment_id=segment_id,
+                                start=float(seg["start"]),
+                                end=float(seg["end"]),
+                                visual_entities=json.dumps(
+                                    visible, ensure_ascii=False
+                                ),
+                            )
                         )
-                        raw_visual = aligner.align_preloaded(
-                            visual_prompt,
-                            images,
-                            max_tokens=visual_max_tokens,
-                            max_slice_nums=visual_slice_nums,
-                        )
+
+                # Single batch call for all active segments; images stay alive for repair
+                if active_idx:
+                    active_images = [batch_images[i] for i in active_idx]
+                    batch_results = aligner._chat_batch(
+                        active_prompts,
+                        active_images,
+                        max_tokens=visual_max_tokens,
+                        max_slice_nums=visual_slice_nums,
+                    )
+                else:
+                    batch_results = []
+
+                # Map results back and close images
+                result_iter = iter(zip(active_idx, active_visible, batch_results))
+                next_active = next(result_iter, None)
+
+                for local_i, (seg, images) in enumerate(zip(batch, batch_images)):
+                    segment_id = str(seg["segment_id"])
+                    if next_active is not None and next_active[0] == local_i:
+                        _, visible, raw_visual = next_active
                         visual_analysis = _validate_visual_analysis(raw_visual, visible)
+                        next_active = next(result_iter, None)
                     else:
                         visual_analysis = {
                             "visual_caption": "",
                             "entity_descriptions": [],
                             "visual_edges": [],
                         }
-                finally:
                     for img in images:
                         img.close()
+                    visual_pass[segment_id] = visual_analysis
 
-                visual_pass[segment_id] = visual_analysis
+                vbar.update(len(batch))
                 atomic_write_json(visual_pass_path, visual_pass)
 
     # -----------------------------------------------------------------

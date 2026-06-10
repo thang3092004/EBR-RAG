@@ -83,6 +83,15 @@ REUSABLE_FULL_STAGES = {
     ),
 }
 
+# Profiles whose visual captioning (Pass 1) output is identical to A1's.
+# visual_pass.json is seeded from full_framework workdir so Pass 1 is skipped.
+VISUAL_PASS_REUSABLE_PROFILES = {"no_transcript_memory", "no_crossmodal_alignment"}
+
+# Profiles that must re-run tracking_base (different config hash) but whose
+# YOLO chunk files are identical to A1's — only link_visual_tracklets differs.
+# Pre-seeding chunks/ lets the stage skip YOLO and only run fast post-processing.
+TRACKING_CHUNK_REUSABLE_PROFILES = {"no_visual_identity_linking"}
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -228,6 +237,45 @@ def _seed_profile_from_full(
                 "stages": seeded_states,
             },
         )
+        # Seed visual_pass.json from A1 for profiles that reuse visual captioning.
+        # visual_pass.json lives inside alignment_caption/segments/ and is purely
+        # frame-based (no transcript memory, no crossmodal config), so it is
+        # identical across ablation profiles that share the same segmentation and
+        # tracking. Seeding it lets Pass 1 be skipped entirely in align_all_segments().
+        if profile in VISUAL_PASS_REUSABLE_PROFILES:
+            src_vpass = (
+                source_video_dir
+                / "alignment_caption"
+                / "segments"
+                / "visual_pass.json"
+            )
+            if src_vpass.exists():
+                dst_seg_dir = (
+                    target_video_dir / "alignment_caption" / "segments"
+                )
+                dst_seg_dir.mkdir(parents=True, exist_ok=True)
+                dst_vpass = dst_seg_dir / "visual_pass.json"
+                if not dst_vpass.exists():
+                    _hardlink_or_copy(str(src_vpass), str(dst_vpass))
+
+        # Seed YOLO chunks for profiles that re-run tracking_base with different
+        # config (different hash → stage cannot be marked done) but whose YOLO
+        # output is identical to A1's. The stage runner skips YOLO inference when
+        # chunk files already exist, then runs only the fast post-processing steps.
+        if profile in TRACKING_CHUNK_REUSABLE_PROFILES:
+            tracking_done = (
+                source_states.get("tracking_base", {}).get("status") == "done"
+            )
+            src_chunks = source_video_dir / "tracking_base" / "chunks"
+            if tracking_done and src_chunks.is_dir() and any(src_chunks.iterdir()):
+                dst_chunks = target_video_dir / "tracking_base" / "chunks"
+                if not dst_chunks.exists():
+                    shutil.copytree(
+                        src_chunks,
+                        dst_chunks,
+                        copy_function=_hardlink_or_copy,
+                    )
+
         seeded += 1
 
     return {
@@ -478,7 +526,6 @@ def _ingest_profile(
     seed_report = {"status": "disabled", "seeded_videos": 0}
     if (
         args.reuse_full_artifacts
-        and not args.strict_pipeline
         and profile in REUSABLE_FULL_STAGES
         and not args.force
         and not args.no_resume

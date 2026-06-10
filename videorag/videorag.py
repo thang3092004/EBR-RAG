@@ -1,16 +1,20 @@
 import os
 import sys
+import importlib.util as _iutil
 from importlib.machinery import ModuleSpec
 from unittest.mock import MagicMock
 
-# Setup robust flash_attn mock to prevent importlib.util.find_spec errors
-flash_attn_spec = ModuleSpec("flash_attn", None)
-flash_attn_mock = MagicMock()
-flash_attn_mock.__spec__ = flash_attn_spec
-flash_attn_mock.__path__ = []
-sys.modules["flash_attn"] = flash_attn_mock
-sys.modules["flash_attn.flash_attn_interface"] = MagicMock()
-sys.modules["flash_attn.bert_padding"] = MagicMock()
+# Only mock flash_attn when the real library is not installed.
+# If flash-attn IS installed, let the real library load so MiniCPM can use
+# FlashAttention2 (set attn_implementation="flash_attention_2").
+if _iutil.find_spec("flash_attn") is None:
+    flash_attn_spec = ModuleSpec("flash_attn", None)
+    flash_attn_mock = MagicMock()
+    flash_attn_mock.__spec__ = flash_attn_spec
+    flash_attn_mock.__path__ = []
+    sys.modules["flash_attn"] = flash_attn_mock
+    sys.modules["flash_attn.flash_attn_interface"] = MagicMock()
+    sys.modules["flash_attn.bert_padding"] = MagicMock()
 
 import json
 import shutil
@@ -147,6 +151,7 @@ class VideoRAG:
     caption_max_slice_nums: int = 2
     caption_visual_max_tokens: int = 200
     caption_visual_slice_nums: int = 1
+    caption_visual_batch_size: int = 4
     entity_memory_recent_events: int = 8
     correspondence_similarity_threshold: float = 0.28
     correspondence_similarity_margin: float = 0.04
