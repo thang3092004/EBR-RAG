@@ -1,5 +1,6 @@
 import asyncio
 import os
+from pathlib import Path
 import torch
 from dataclasses import dataclass
 from typing import Optional
@@ -95,22 +96,28 @@ class NanoVectorDBVideoSegmentStorage(BaseVectorStorage):
 
         from .._videoutil.feature import encode_video_segments
 
-        checkpoint = os.path.join(".checkpoints", "imagebind_huge.pth")
+        _repo_root = Path(__file__).parents[2]
+        checkpoint = _repo_root / ".checkpoints" / "imagebind_huge.pth"
         if self.global_config.get("pipeline_strict", False):
-            if not os.path.isfile(checkpoint):
+            if not checkpoint.is_file():
                 raise FileNotFoundError(
                     "Strict pipeline requires local ImageBind weights: "
-                    f"{os.path.abspath(checkpoint)}"
+                    f"{checkpoint}"
                 )
-            if os.path.getsize(checkpoint) < 4_000_000_000:
+            if checkpoint.stat().st_size < 4_000_000_000:
                 raise RuntimeError(
                     "Strict pipeline found a truncated ImageBind checkpoint: "
-                    f"{os.path.abspath(checkpoint)}"
+                    f"{checkpoint}"
                 )
             if not torch.cuda.is_available():
                 raise RuntimeError("Strict pipeline requires CUDA for ImageBind.")
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        embedder = imagebind_model.imagebind_huge(pretrained=True).to(device)
+        _prev_cwd = os.getcwd()
+        try:
+            os.chdir(_repo_root)
+            embedder = imagebind_model.imagebind_huge(pretrained=True).to(device)
+        finally:
+            os.chdir(_prev_cwd)
         embedder.eval()
         
         logger.info(f"Inserting {len(segment_index2name)} segments to {self.namespace}")

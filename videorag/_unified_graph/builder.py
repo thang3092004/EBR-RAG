@@ -58,7 +58,6 @@ async def build_unified_graph(
                 target,
                 {
                     **edge,
-                    "source_id": segment_id,
                     "weight": float(edge.get("confidence", 0.0)),
                     "description": str(edge.get("description") or edge["predicate"]),
                 },

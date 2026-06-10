@@ -149,10 +149,10 @@ class UnifiedNetworkXStorage(BaseGraphStorage):
             ):
                 records.append(
                     {
-                        "source_id": source,
-                        "target_id": target,
                         "edge_id": str(key),
                         **_decode_attributes(data),
+                        "source_id": source,
+                        "target_id": target,
                     }
                 )
         if direction in {"in", "both"}:
@@ -163,10 +163,10 @@ class UnifiedNetworkXStorage(BaseGraphStorage):
             ):
                 records.append(
                     {
-                        "source_id": source,
-                        "target_id": target,
                         "edge_id": str(key),
                         **_decode_attributes(data),
+                        "source_id": source,
+                        "target_id": target,
                     }
                 )
         return records

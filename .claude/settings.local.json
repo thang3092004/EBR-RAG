@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell *)",
+      "Bash(where yt-dlp *)",
+      "Bash(grep -rn \"\\\\.pt\\\\|\\\\.bin\\\\|\\\\.model\\\\|hardcoded\\\\|/path/\\\\|C:\\\\\\\\\\\\\\\\\" videorag/ --include=\"*.py\")"
+    ]
+  }
+}

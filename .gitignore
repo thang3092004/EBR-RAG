@@ -46,6 +46,9 @@ judge_output.json
 !SERVER_UNIFIED_V2.md
 !GRAPH_ABLATION_PLAN.md
 !MINIMAL_ABLATION_0_6_11.md
+!CLAUDE.md
+!.claude/
+!.claude/**
 /.pytest_tmp*/
 /.tmp_ablation*/
 !papers/

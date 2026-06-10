@@ -61,7 +61,15 @@ def atomic_write_json(path: str | Path, payload: Any) -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2, default=_json_default)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temporary, target)
+    # Windows: antivirus may briefly lock a newly-written file; retry on PermissionError
+    for _attempt in range(6):
+        try:
+            os.replace(temporary, target)
+            return
+        except PermissionError:
+            if _attempt == 5:
+                raise
+            time.sleep(0.05 * (2 ** _attempt))
 
 
 def read_json(path: str | Path, default: Any = None) -> Any:
