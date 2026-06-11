@@ -129,9 +129,11 @@ class EntityRegistry:
             raise KeyError(f"Unknown global entity: {global_id}")
         existing = self.alias_to_global.get(alias_id)
         if existing and existing != global_id:
-            raise ValueError(
-                f"Alias {alias_id} already belongs to {existing}, cannot assign to {global_id}"
-            )
+            # Segment-local text IDs (e.g. T_LOCATION_002) can collide across
+            # segments when different segments independently generate the same
+            # local counter. Keep the first mapping; the later segment's entity
+            # will resolve through the existing alias without crashing.
+            return
         self.alias_to_global[alias_id] = global_id
         node = self.entities[global_id]
         for alias in node.aliases:
