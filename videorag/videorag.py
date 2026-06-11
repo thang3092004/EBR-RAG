@@ -151,7 +151,7 @@ class VideoRAG:
     caption_max_slice_nums: int = 2
     caption_visual_max_tokens: int = 200
     caption_visual_slice_nums: int = 1
-    caption_visual_batch_size: int = 4
+    caption_visual_batch_size: int = 2
     entity_memory_recent_events: int = 8
     correspondence_similarity_threshold: float = 0.28
     correspondence_similarity_margin: float = 0.04

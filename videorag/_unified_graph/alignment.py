@@ -275,8 +275,11 @@ class MiniCPMAligner:
         MiniCPM batch mode is triggered when msgs is a list-of-lists.
         Images must be embedded in message content; image=None is required.
         Returns one result dict per input (empty dict on unrecoverable failure).
+        On CUDA OOM falls back to sequential single-item calls and frees cache.
         Caller is responsible for closing all PIL Images after this returns.
         """
+        import torch
+
         effective_slices = max_slice_nums if max_slice_nums is not None else int(
             self.config.get("caption_max_slice_nums", 2)
         )
@@ -285,14 +288,29 @@ class MiniCPMAligner:
             [{"role": "user", "content": imgs + [prompt]}]
             for imgs, prompt in zip(images_list, prompts)
         ]
-        responses = self.model.chat(
-            image=None,
-            msgs=msgs,
-            tokenizer=self.tokenizer,
-            use_image_id=False,
-            max_slice_nums=effective_slices,
-            max_new_tokens=max_tokens,
-        )
+        try:
+            responses = self.model.chat(
+                image=None,
+                msgs=msgs,
+                tokenizer=self.tokenizer,
+                use_image_id=False,
+                max_slice_nums=effective_slices,
+                max_new_tokens=max_tokens,
+            )
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            torch.cuda.empty_cache()
+            # OOM fallback: process each item individually
+            return [
+                self._chat_with_images(
+                    prompts[i],
+                    images_list[i],
+                    max_tokens=max_tokens,
+                    max_slice_nums=max_slice_nums,
+                )
+                for i in range(len(prompts))
+            ]
         results: list[dict[str, Any]] = []
         for i, response in enumerate(responses):
             try:
