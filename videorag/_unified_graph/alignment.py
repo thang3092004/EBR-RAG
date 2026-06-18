@@ -841,6 +841,34 @@ def run_crossmodal_merge(
                 if mention is None and match["text_id"] in registry.entities:
                     memory_node = registry.entities[match["text_id"]]
                     vis_node = registry.entities.get(match["visual_id"])
+                    if vis_node:
+                        registry.add_alias(
+                            match["text_id"],
+                            match["visual_id"],
+                            source="crossmodal_merge",
+                            label=memory_node.canonical_name or vis_node.canonical_name,
+                            confidence=0.7,
+                            segment_id=str(batch[0]["segment_id"]),
+                        )
+                        old_mem = entity_memory.pop(match["text_id"], None)
+                        if old_mem:
+                            new_mem = entity_memory.setdefault(match["visual_id"], {
+                                "canonical_name": "",
+                                "accumulated_descriptions": [],
+                                "relationships": [],
+                                "segments_seen": [],
+                            })
+                            new_mem["accumulated_descriptions"] = (
+                                old_mem.get("accumulated_descriptions", [])
+                                + new_mem["accumulated_descriptions"]
+                            )[-10:]
+                            for r in old_mem.get("relationships", []):
+                                if r not in new_mem["relationships"]:
+                                    new_mem["relationships"].append(r)
+                            new_mem["relationships"] = new_mem["relationships"][-10:]
+                            for s in old_mem.get("segments_seen", []):
+                                if s not in new_mem["segments_seen"]:
+                                    new_mem["segments_seen"].append(s)
                     if (
                         vis_node
                         and memory_node.canonical_name
