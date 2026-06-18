@@ -177,9 +177,14 @@ def smart_segment(
         indices.reverse()
         boundaries = [candidates[index].time for index in indices]
 
+    shot_times = [float(b["time"]) for b in shot_boundaries]
     segments: list[dict[str, Any]] = []
     for index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
         segment_id = f"SEG_{index:05d}"
+        has_shot_at_start = (
+            index > 0
+            and any(abs(t - start) <= 1.0 for t in shot_times)
+        )
         segments.append(
             {
                 "segment_id": segment_id,
@@ -189,6 +194,7 @@ def smart_segment(
                 "duration": float(end - start),
                 "context_start": max(0.0, float(start) - context),
                 "context_end": min(duration, float(end) + context),
+                "has_shot_at_start": has_shot_at_start,
             }
         )
     return segments

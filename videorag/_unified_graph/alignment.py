@@ -25,6 +25,12 @@ from .registry import EntityRegistry, normalize_alias
 from .schema import EdgeOccurrence, ProvenanceRecord, bbox_position
 
 
+GENERIC_VISUAL_LABELS = {
+    "person", "animal", "object", "vehicle", "plant",
+    "food", "sports", "outdoor", "indoor",
+}
+
+
 VISUAL_CAPTION_PROMPT = """Describe what is happening in this video segment.
 
 Your description must include:
@@ -438,6 +444,42 @@ def run_visual_captioning(
 # Sub-step 8b — Cross-modal Entity Merge (GPT-4o-mini, sequential)
 # =====================================================================
 
+def _filter_entity_memory(
+    entity_memory: dict[str, Any],
+    active_entity_ids: set[str],
+    recent_segment_ids: set[str],
+    *,
+    global_threshold: int = 5,
+    max_entities: int = 25,
+) -> dict[str, Any]:
+    keep: dict[str, int] = {}
+
+    for eid in active_entity_ids:
+        if eid in entity_memory:
+            keep[eid] = 1
+
+    for eid in list(keep.keys()):
+        for rel_str in entity_memory.get(eid, {}).get("relationships", []):
+            parts = rel_str.split()
+            if len(parts) >= 2:
+                neighbor_id = parts[1].strip("(),.")
+                if neighbor_id in entity_memory and neighbor_id not in keep:
+                    keep[neighbor_id] = 2
+
+    for eid, data in entity_memory.items():
+        if eid not in keep:
+            if any(s in recent_segment_ids for s in data.get("segments_seen", [])):
+                keep[eid] = 3
+
+    for eid, data in entity_memory.items():
+        if eid not in keep:
+            if len(data.get("segments_seen", [])) >= global_threshold:
+                keep[eid] = 4
+
+    sorted_eids = sorted(keep.keys(), key=lambda e: keep[e])[:max_entities]
+    return {eid: entity_memory[eid] for eid in sorted_eids if eid in entity_memory}
+
+
 def _build_merge_prompt(
     batch_segments: list[dict[str, Any]],
     captions: dict[str, str],
@@ -447,11 +489,29 @@ def _build_merge_prompt(
     entity_memory: dict[str, Any],
     *,
     transcripts: dict[str, str] | None = None,
+    recent_segment_ids: set[str] | None = None,
+    max_memory_entities: int = 25,
 ) -> str:
     from collections import Counter
 
     transcripts = transcripts or {}
-    entity_memory_json = json.dumps(entity_memory, ensure_ascii=False) if entity_memory else "{}"
+
+    _active_ids: set[str] = set()
+    for _seg in batch_segments:
+        _sid = str(_seg["segment_id"])
+        for _obs in observations:
+            if str(_obs.get("segment_id")) == _sid:
+                _active_ids.add(str(_obs["entity_id"]))
+        for _mention in text_results.get(_sid, {}).get("mentions", []):
+            _active_ids.add(_mention["text_id"])
+
+    filtered_memory = _filter_entity_memory(
+        entity_memory,
+        _active_ids,
+        recent_segment_ids or set(),
+        max_entities=max_memory_entities,
+    )
+    entity_memory_json = json.dumps(filtered_memory, ensure_ascii=False) if filtered_memory else "{}"
 
     ve_position: dict[str, str] = {
         ve["entity_id"]: ve.get("dominant_position") or "unknown"
@@ -558,7 +618,9 @@ def _validate_merge_result(
     raw: dict[str, Any],
     visual_ids: set[str],
     text_ids: set[str],
+    registry_entity_ids: set[str] | None = None,
 ) -> dict[str, Any]:
+    registry_entity_ids = registry_entity_ids or set()
     matches = []
     for match in raw.get("matches", []):
         vid = str(match.get("visual_id", "")).strip()
@@ -566,7 +628,7 @@ def _validate_merge_result(
         if tid is not None:
             tid = str(tid).strip()
         if vid in visual_ids:
-            if tid is None or tid in text_ids:
+            if tid is None or tid in text_ids or tid in registry_entity_ids:
                 matches.append({
                     "visual_id": vid,
                     "text_id": tid,
@@ -704,10 +766,22 @@ def run_crossmodal_merge(
                     )
                 continue
 
+            all_segment_ids = [str(s["segment_id"]) for s in segments]
+            _first_seg_id = str(batch[0]["segment_id"]) if batch else ""
+            _first_idx = all_segment_ids.index(_first_seg_id) if _first_seg_id in all_segment_ids else 0
+            _recent_segment_ids: set[str] = set()
+            for i in range(_first_idx - 1, max(_first_idx - 21, -1), -1):
+                seg = segments[i]
+                if seg.get("has_shot_at_start", False):
+                    break
+                _recent_segment_ids.add(str(seg["segment_id"]))
+
             prompt = _build_merge_prompt(
                 batch, captions, visual_entities, text_results,
                 observations, entity_memory,
                 transcripts=transcripts or {},
+                recent_segment_ids=_recent_segment_ids,
+                max_memory_entities=int(config.get("entity_memory_max_context", 25)),
             )
 
             try:
@@ -728,7 +802,10 @@ def run_crossmodal_merge(
                 for mention in text_results.get(seg_id, {}).get("mentions", []):
                     batch_text_ids.add(mention["text_id"])
 
-            validated = _validate_merge_result(raw_result, batch_visual_ids, batch_text_ids)
+            validated = _validate_merge_result(
+                raw_result, batch_visual_ids, batch_text_ids,
+                registry_entity_ids=set(registry.entities.keys()),
+            )
 
             for match in validated["matches"]:
                 if match["text_id"] is None:
@@ -751,6 +828,34 @@ def run_crossmodal_merge(
                         confidence=float(mention.get("confidence", 0.0)),
                         segment_id=seg_id,
                     )
+                    node = registry.entities.get(match["visual_id"])
+                    if node and mention.get("label"):
+                        if (
+                            node.canonical_name in GENERIC_VISUAL_LABELS
+                            or node.canonical_name == node.entity_id
+                        ):
+                            node.canonical_name = mention["label"]
+                    if match["visual_id"] in entity_memory and mention.get("label"):
+                        entity_memory[match["visual_id"]]["canonical_name"] = mention["label"]
+
+                if mention is None and match["text_id"] in registry.entities:
+                    memory_node = registry.entities[match["text_id"]]
+                    vis_node = registry.entities.get(match["visual_id"])
+                    if (
+                        vis_node
+                        and memory_node.canonical_name
+                        and memory_node.canonical_name not in GENERIC_VISUAL_LABELS
+                        and memory_node.canonical_name != vis_node.entity_id
+                    ):
+                        if (
+                            vis_node.canonical_name in GENERIC_VISUAL_LABELS
+                            or vis_node.canonical_name == vis_node.entity_id
+                        ):
+                            vis_node.canonical_name = memory_node.canonical_name
+                        if match["visual_id"] in entity_memory:
+                            entity_memory[match["visual_id"]]["canonical_name"] = (
+                                memory_node.canonical_name
+                            )
 
             for seg in batch:
                 seg_id = str(seg["segment_id"])
