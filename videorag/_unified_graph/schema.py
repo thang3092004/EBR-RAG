@@ -35,6 +35,19 @@ def normalize_entity_type(value: str | None) -> str:
     return aliases.get(clean, clean if clean in GLOBAL_PREFIXES else "unknown")
 
 
+def bbox_position(bbox: list[float] | None) -> str | None:
+    if not bbox or len(bbox) != 4:
+        return None
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    area = (x2 - x1) * (y2 - y1)
+    h_zone = "left" if cx < 0.33 else ("right" if cx > 0.66 else "center")
+    v_zone = "top" if cy < 0.33 else ("bottom" if cy > 0.66 else "middle")
+    size = "small" if area < 0.05 else ("large" if area > 0.20 else "medium")
+    return f"{v_zone}-{h_zone}, {size}"
+
+
 @dataclass
 class ProvenanceRecord:
     source: str
@@ -44,6 +57,7 @@ class ProvenanceRecord:
     end: float
     frame_time: float | None = None
     bbox: list[float] | None = None
+    position: str | None = None
     text: str | None = None
     confidence: float = 0.0
 

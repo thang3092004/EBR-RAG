@@ -381,7 +381,7 @@ def link_visual_tracklets(
     for tracklet in tracklets:
         grouped[disjoint.find(tracklet["tracklet_id"])].append(tracklet)
 
-    from .._unified_graph.schema import ProvenanceRecord
+    from .._unified_graph.schema import ProvenanceRecord, bbox_position
 
     visual_entities = []
     for _, group in sorted(
@@ -408,6 +408,8 @@ def link_visual_tracklets(
             confidence=confidence,
             attributes={"detector_label": label},
         )
+        position_history: list[dict[str, Any]] = []
+        position_counts: dict[str, int] = defaultdict(int)
         for tracklet in group:
             registry.add_alias(
                 tracklet["tracklet_id"],
@@ -418,6 +420,8 @@ def link_visual_tracklets(
             )
             for observation in tracklet["observations"]:
                 observation["entity_id"] = global_id
+                obs_bbox = list(observation["bbox"])
+                obs_position = bbox_position(obs_bbox)
                 registry.add_provenance(
                     global_id,
                     ProvenanceRecord(
@@ -427,10 +431,23 @@ def link_visual_tracklets(
                         start=float(observation["time"]),
                         end=float(observation["time"]),
                         frame_time=float(observation["time"]),
-                        bbox=list(observation["bbox"]),
+                        bbox=obs_bbox,
+                        position=obs_position,
                         confidence=float(observation["confidence"]),
                     ),
                 )
+                if obs_position:
+                    position_history.append({
+                        "segment_id": str(observation["segment_id"]),
+                        "position": obs_position,
+                        "time": float(observation["time"]),
+                    })
+                    position_counts[obs_position] += 1
+        dominant_position = (
+            max(position_counts, key=position_counts.get)
+            if position_counts
+            else None
+        )
         visual_entities.append(
             {
                 "entity_id": global_id,
@@ -438,6 +455,8 @@ def link_visual_tracklets(
                 "label": label,
                 "tracklets": [tracklet["tracklet_id"] for tracklet in group],
                 "confidence": confidence,
+                "dominant_position": dominant_position,
+                "position_history": position_history,
             }
         )
     return visual_entities

@@ -75,37 +75,6 @@ def _visible_entities(
     }
 
 
-def _draw_overlay(frame, time_s: float, observations: list[dict[str, Any]], cv2):
-    output = frame.copy()
-    candidates = [
-        observation
-        for observation in observations
-        if abs(float(observation.get("time", 0.0)) - time_s) <= 0.35
-    ]
-    for observation in candidates:
-        bbox = observation.get("bbox") or []
-        if len(bbox) != 4:
-            continue
-        x1, y1, x2, y2 = [int(round(float(value))) for value in bbox]
-        label = str(
-            observation.get("entity_id")
-            or observation.get("tracklet_id")
-            or observation.get("local_track_id")
-        )
-        cv2.rectangle(output, (x1, y1), (x2, y2), (0, 0, 255), 2)
-        cv2.putText(
-            output,
-            label,
-            (x1, max(15, y1 - 5)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-    return output
-
-
 def select_segment_frames(
     video_path: str,
     segment: dict[str, Any],
@@ -224,10 +193,9 @@ def select_segment_frames(
     for index, item in enumerate(selected):
         filename = f"{segment['segment_id']}_{index:02d}_{item['time']:.3f}.jpg"
         frame_path = output_path / filename
-        overlay = _draw_overlay(item["frame"], item["time"], observations, cv2)
         written = cv2.imwrite(
             str(frame_path),
-            overlay,
+            item["frame"],
             [cv2.IMWRITE_JPEG_QUALITY, 88],
         )
         if config.get("pipeline_strict", False) and not written:

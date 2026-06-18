@@ -20,9 +20,8 @@ from .._entity_anchor.tracker_v2 import (
     run_chunked_tracking,
 )
 from .._op import get_chunks
-from .._unified_graph.alignment import MiniCPMAligner, align_all_segments
+from .._unified_graph.alignment import MiniCPMCaptioner, align_all_segments
 from .._unified_graph.builder import build_unified_graph, validate_unified_graph
-from .._unified_graph.correspondence import OpenCLIPTextEncoder
 from .._unified_graph.registry import EntityRegistry, normalize_alias
 from .._videoutil.asr_v2 import (
     assign_words_to_segments,
@@ -216,15 +215,11 @@ class UnifiedIngestPipeline:
         self.restart_stage = restart_stage
         self.force = force
         self.loop = asyncio.new_event_loop()
-        self.correspondence_encoder = None
 
     def _await(self, awaitable):
         return self.loop.run_until_complete(awaitable)
 
     def close(self) -> None:
-        if self.correspondence_encoder is not None:
-            self.correspondence_encoder.close()
-            self.correspondence_encoder = None
         self.loop.close()
 
     def run(self, video_paths: list[str]) -> list[dict[str, Any]]:
@@ -698,6 +693,10 @@ class UnifiedIngestPipeline:
         observations = read_json(
             runner.output("tracking_base", "observations.json")
         )
+        visual_entities_list = read_json(
+            runner.output("tracking_base", "visual_entities.json"),
+            [],
+        )
         registry = EntityRegistry(
             read_json(runner.output("tracking_base", "registry.json"))
         )
@@ -706,7 +705,7 @@ class UnifiedIngestPipeline:
             or getattr(self.vrag, "caption_tokenizer", None) is None
         ):
             self.vrag.load_caption_model()
-        aligner = MiniCPMAligner(
+        captioner = MiniCPMCaptioner(
             self.config,
             model=getattr(self.vrag, "caption_model", None),
             tokenizer=getattr(self.vrag, "caption_tokenizer", None),
@@ -714,29 +713,25 @@ class UnifiedIngestPipeline:
         crossmodal_enabled = not bool(
             self.config.get("disable_crossmodal_alignment", False)
         )
-        if crossmodal_enabled and self.correspondence_encoder is None:
-            self.correspondence_encoder = OpenCLIPTextEncoder(self.config)
         with context.progress(
             total=len(segments),
             unit="seg",
-            description="MiniCPM caption and cross-modal alignment",
+            description="Visual caption + cross-modal merge",
         ) as progress:
-            try:
-                result = align_all_segments(
-                    video_id,
-                    segments,
-                    selections,
-                    text_results,
-                    observations,
-                    registry,
-                    self.config,
-                    context.path("segments"),
-                    progress=progress,
-                    aligner=aligner,
-                    correspondence_encoder=self.correspondence_encoder,
-                )
-            finally:
-                aligner.close()
+            result = align_all_segments(
+                video_id,
+                segments,
+                selections,
+                text_results,
+                observations,
+                registry,
+                self.config,
+                context.path("segments"),
+                progress=progress,
+                aligner=captioner,
+                visual_entities=visual_entities_list,
+                loop=self.loop,
+            )
         context.write_json("alignment.json", result)
         stale_entity_ids = _merge_global_registry(
             self.vrag.working_dir,
@@ -748,17 +743,17 @@ class UnifiedIngestPipeline:
         context.report_metrics(
             entities=len(result["registry"]["entities"]),
             edges=result["edge_count"],
-            model="MiniCPM-V-2_6-int4",
+            caption_model="MiniCPM-V-2_6-int4",
+            merge_model="gpt-4o-mini",
             stale_entities=len(stale_entity_ids),
-            correspondence=result.get("correspondence_stats", {}),
             crossmodal_alignment=crossmodal_enabled,
         )
         return {
             "output": str(context.path("alignment.json")),
             "entities": len(result["registry"]["entities"]),
             "edges": result["edge_count"],
-            "model": "MiniCPM-V-2_6-int4",
-            "correspondence": result.get("correspondence_stats", {}),
+            "caption_model": "MiniCPM-V-2_6-int4",
+            "merge_model": "gpt-4o-mini",
         }
 
     def _segment_storage_payload(
@@ -773,33 +768,53 @@ class UnifiedIngestPipeline:
         selections = read_json(
             runner.output("frame_selection", "frame_selections.json")
         )
+        asr = read_json(runner.output("asr", "asr.json"))
+        by_segment = assign_words_to_segments(asr["words"], segments)
+        registry_data = alignment.get("registry", {})
+        entity_names: dict[str, str] = {}
+        for entity in registry_data.get("entities", []):
+            entity_names[entity["entity_id"]] = entity.get(
+                "canonical_name", entity["entity_id"]
+            )
+
         payload = {}
         for segment in segments:
             segment_id = segment["segment_id"]
-            aligned = alignment["segments"][segment_id]
+            aligned = alignment["segments"].get(segment_id, {})
+
+            words = by_segment.get(segment_id, [])
+            original_transcript = " ".join(
+                str(w["text"]) for w in sorted(
+                    words, key=lambda w: float(w["start"])
+                )
+            )
+
             visible_ids = sorted(
                 {
                     node
                     for edge in aligned.get("edges", [])
                     for node in (edge["source_id"], edge["target_id"])
                 }
+                | set(aligned.get("entity_ids", []))
             )
             entity_memory = (
                 "Entity Memory:\n"
-                + "\n".join(f"- {entity_id}" for entity_id in visible_ids)
+                + "\n".join(
+                    f"- {eid} ({entity_names.get(eid, eid)})"
+                    for eid in visible_ids
+                )
                 if visible_ids
                 else ""
             )
             caption = aligned.get("caption", "")
-            transcript = aligned.get("rewritten_transcript", "")
             content = (
                 f"{entity_memory}\nCaption:\n{caption}\n"
-                f"Transcript:\n{transcript}\n"
+                f"Transcript:\n{original_transcript}\n"
             ).strip()
             payload[str(segment["index"])] = {
                 "content": content,
                 "time": f"{segment['start']:.3f}-{segment['end']:.3f}",
-                "transcript": transcript,
+                "transcript": original_transcript,
                 "caption": caption,
                 "entity_memory": entity_memory,
                 "frame_times": [
