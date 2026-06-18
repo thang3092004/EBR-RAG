@@ -700,6 +700,18 @@ class UnifiedIngestPipeline:
         registry = EntityRegistry(
             read_json(runner.output("tracking_base", "registry.json"))
         )
+        asr = read_json(runner.output("asr", "asr.json"))
+        by_segment = assign_words_to_segments(asr["words"], segments)
+        transcripts: dict[str, str] = {
+            str(seg["segment_id"]): " ".join(
+                str(w["text"])
+                for w in sorted(
+                    by_segment.get(str(seg["segment_id"]), []),
+                    key=lambda w: float(w["start"]),
+                )
+            )
+            for seg in segments
+        }
         if (
             getattr(self.vrag, "caption_model", None) is None
             or getattr(self.vrag, "caption_tokenizer", None) is None
@@ -731,6 +743,7 @@ class UnifiedIngestPipeline:
                 aligner=captioner,
                 visual_entities=visual_entities_list,
                 loop=self.loop,
+                transcripts=transcripts,
             )
         context.write_json("alignment.json", result)
         stale_entity_ids = _merge_global_registry(
@@ -846,6 +859,7 @@ class UnifiedIngestPipeline:
                 alignment["registry"],
                 alignment["segments"],
                 clear=False,
+                entity_memory=alignment.get("entity_memory", {}),
             )
         )
         segment_payload = self._segment_storage_payload(runner, video_id)

@@ -11,8 +11,10 @@ async def build_unified_graph(
     alignment_segments: dict[str, dict[str, Any]],
     *,
     clear: bool = True,
+    entity_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     registry = EntityRegistry(registry_payload)
+    entity_memory = entity_memory or {}
     if clear and hasattr(storage, "clear"):
         await storage.clear()
 
@@ -26,13 +28,19 @@ async def build_unified_graph(
                 if provenance.segment_id
             }
         )
+        mem = entity_memory.get(entity_id, {})
+        descriptions = mem.get("accumulated_descriptions", [])
+        if descriptions:
+            description = f"{node.canonical_name}: " + "; ".join(descriptions[-5:])
+        else:
+            description = node.canonical_name
         await storage.upsert_node(
             entity_id,
             {
                 "entity_id": entity_id,
                 "entity_type": node.entity_type,
                 "canonical_name": node.canonical_name,
-                "description": node.canonical_name,
+                "description": description,
                 "aliases": [alias.to_dict() for alias in node.aliases],
                 "sources": node.sources,
                 "first_seen": node.first_seen if node.first_seen is not None else -1.0,

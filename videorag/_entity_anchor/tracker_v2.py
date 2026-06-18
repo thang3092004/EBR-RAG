@@ -110,7 +110,14 @@ def _process_chunk(
                     )
                     label = str(class_names.get(class_id, class_id))
                     entity_type = normalize_entity_type(label)
-                    bbox = [float(value) for value in xyxy[box_index].tolist()]
+                    raw_bbox = [float(value) for value in xyxy[box_index].tolist()]
+                    h_frame, w_frame = frame.shape[:2]
+                    bbox = [
+                        raw_bbox[0] / w_frame,
+                        raw_bbox[1] / h_frame,
+                        raw_bbox[2] / w_frame,
+                        raw_bbox[3] / h_frame,
+                    ]
                     confidence = (
                         float(confidences[box_index])
                         if box_index < len(confidences)
@@ -128,10 +135,10 @@ def _process_chunk(
                         "confidence": confidence,
                         "label": label,
                         "entity_type": entity_type,
-                        "appearance": _appearance_histogram(frame, bbox),
+                        "appearance": _appearance_histogram(frame, raw_bbox),
                     }
                     observations.append(observation)
-                    x1, y1, x2, y2 = [int(round(value)) for value in bbox]
+                    x1, y1, x2, y2 = [int(round(value)) for value in raw_bbox]
                     crop = frame[
                         max(0, y1) : max(0, y2),
                         max(0, x1) : max(0, x2),

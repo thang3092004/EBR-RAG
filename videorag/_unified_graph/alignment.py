@@ -22,7 +22,7 @@ from PIL import Image
 
 from ..pipeline.stage_runner import atomic_write_json, read_json
 from .registry import EntityRegistry, normalize_alias
-from .schema import EdgeOccurrence, ProvenanceRecord
+from .schema import EdgeOccurrence, ProvenanceRecord, bbox_position
 
 
 VISUAL_CAPTION_PROMPT = """Describe what is happening in this video segment.
@@ -445,11 +445,19 @@ def _build_merge_prompt(
     text_results: dict[str, dict[str, Any]],
     observations: list[dict[str, Any]],
     entity_memory: dict[str, Any],
+    *,
+    transcripts: dict[str, str] | None = None,
 ) -> str:
+    from collections import Counter
+
+    transcripts = transcripts or {}
     entity_memory_json = json.dumps(entity_memory, ensure_ascii=False) if entity_memory else "{}"
 
-    v_lines = []
-    batch_segment_ids = {str(seg["segment_id"]) for seg in batch_segments}
+    ve_position: dict[str, str] = {
+        ve["entity_id"]: ve.get("dominant_position") or "unknown"
+        for ve in visual_entities
+    }
+
     batch_visual_ids: set[str] = set()
     for seg in batch_segments:
         seg_id = str(seg["segment_id"])
@@ -457,39 +465,84 @@ def _build_merge_prompt(
             if str(obs.get("segment_id")) == seg_id:
                 batch_visual_ids.add(str(obs["entity_id"]))
 
+    v_lines = []
     for ve in visual_entities:
         eid = ve["entity_id"]
         if eid not in batch_visual_ids:
             continue
-        pos = ve.get("dominant_position", "unknown")
+        pos = ve_position.get(eid, "unknown")
         v_lines.append(
             f"- {eid}: {ve['entity_type']} ({ve['label']}), "
-            f"dominant position: {pos}"
+            f"dominant position across video: {pos}"
         )
     visual_entities_str = "\n".join(v_lines) if v_lines else "(none)"
 
-    t_lines = []
+    t_seen: dict[str, dict[str, Any]] = {}
     for seg in batch_segments:
         seg_id = str(seg["segment_id"])
-        text_result = text_results.get(seg_id, {})
-        for mention in text_result.get("mentions", []):
-            t_lines.append(
-                f"- {mention['text_id']}: \"{mention['label']}\" "
-                f"({mention['entity_type']})"
-            )
-    t_lines = list(dict.fromkeys(t_lines))
+        for mention in text_results.get(seg_id, {}).get("mentions", []):
+            tid = mention["text_id"]
+            if tid not in t_seen:
+                t_seen[tid] = mention
+
+    t_lines = []
+    for tid, mention in t_seen.items():
+        surface = (
+            mention["occurrences"][0]["text"]
+            if mention.get("occurrences")
+            else mention["label"]
+        )
+        start = mention.get("start", 0.0)
+        t_lines.append(
+            f"- {tid}: label=\"{mention['label']}\", type={mention['entity_type']}, "
+            f"surface_text=\"{surface}\", first_seen={start:.1f}s"
+        )
     transcript_entities_str = "\n".join(t_lines) if t_lines else "(none)"
 
     segments_data_parts = []
     for seg in batch_segments:
         seg_id = str(seg["segment_id"])
         caption = captions.get(seg_id, "")
-        seg_visual = _visible_entities(seg_id, observations)
-        v_ids = ", ".join(e["entity_id"] for e in seg_visual) or "(none)"
+        raw_transcript = transcripts.get(seg_id, "")
+
+        seg_obs_by_entity: dict[str, list[dict[str, Any]]] = {}
+        for obs in observations:
+            if str(obs.get("segment_id")) == seg_id:
+                eid = str(obs["entity_id"])
+                seg_obs_by_entity.setdefault(eid, []).append(obs)
+
+        seg_v_parts = []
+        for eid, obs_list in sorted(seg_obs_by_entity.items()):
+            pos_counts: Counter = Counter()
+            for obs in obs_list:
+                p = bbox_position(obs.get("bbox"))
+                if p:
+                    pos_counts[p] += 1
+            seg_pos = pos_counts.most_common(1)[0][0] if pos_counts else ve_position.get(eid, "unknown")
+            ve_info = next((ve for ve in visual_entities if ve["entity_id"] == eid), {})
+            seg_v_parts.append(
+                f"{eid} ({ve_info.get('label', '?')}, pos_in_segment: {seg_pos})"
+            )
+        seg_v_str = ", ".join(seg_v_parts) if seg_v_parts else "(none)"
+
+        seg_t_parts = []
+        for mention in text_results.get(seg_id, {}).get("mentions", []):
+            surface = (
+                mention["occurrences"][0]["text"]
+                if mention.get("occurrences")
+                else mention["label"]
+            )
+            seg_t_parts.append(
+                f"{mention['text_id']} (\"{surface}\", {mention['entity_type']})"
+            )
+        seg_t_str = ", ".join(seg_t_parts) if seg_t_parts else "(none)"
+
         segments_data_parts.append(
             f"SEGMENT {seg_id} [{seg['start']:.1f}s - {seg['end']:.1f}s]:\n"
             f"Visual caption: {caption}\n"
-            f"Visual entities present: {v_ids}"
+            f"Transcript: {raw_transcript}\n"
+            f"Visual entities in this segment: {seg_v_str}\n"
+            f"Transcript entities in this segment: {seg_t_str}"
         )
     segments_data_str = "\n\n".join(segments_data_parts)
 
@@ -575,6 +628,7 @@ def run_crossmodal_merge(
     *,
     loop=None,
     progress=None,
+    transcripts: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run cross-modal entity merge using GPT-4o-mini in sequential batches."""
     import asyncio
@@ -653,6 +707,7 @@ def run_crossmodal_merge(
             prompt = _build_merge_prompt(
                 batch, captions, visual_entities, text_results,
                 observations, entity_memory,
+                transcripts=transcripts or {},
             )
 
             try:
@@ -734,6 +789,18 @@ def run_crossmodal_merge(
                     entry["canonical_name"] = node.canonical_name
                 entry["accumulated_descriptions"].append(update["new_description"])
                 entry["accumulated_descriptions"] = entry["accumulated_descriptions"][-10:]
+                for seg in batch:
+                    seg_id = str(seg["segment_id"])
+                    seg_has_entity = any(
+                        str(obs.get("entity_id")) == canonical
+                        for obs in observations
+                        if str(obs.get("segment_id")) == seg_id
+                    ) or any(
+                        m["text_id"] == eid or registry.resolve(m["text_id"]) == canonical
+                        for m in text_results.get(seg_id, {}).get("mentions", [])
+                    )
+                    if seg_has_entity and seg_id not in entry["segments_seen"]:
+                        entry["segments_seen"].append(seg_id)
 
             seg_edges: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for rel in validated["relationships"]:
@@ -887,6 +954,7 @@ def align_all_segments(
     aligner: MiniCPMCaptioner | None = None,
     visual_entities: list[dict[str, Any]] | None = None,
     loop=None,
+    transcripts: dict[str, str] | None = None,
     # legacy kwargs kept for backward compat — ignored
     correspondence_encoder=None,
 ) -> dict[str, Any]:
@@ -919,6 +987,7 @@ def align_all_segments(
         checkpoint_path,
         loop=loop,
         progress=progress,
+        transcripts=transcripts,
     )
 
     return result
