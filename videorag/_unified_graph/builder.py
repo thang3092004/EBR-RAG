@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .registry import EntityRegistry, PROVISIONAL_PATTERN
+
+logger = logging.getLogger(__name__)
 
 
 async def build_unified_graph(
@@ -94,12 +97,22 @@ async def validate_unified_graph(storage) -> dict[str, Any]:
             missing_provenance.append(
                 {"source": source, "target": target, "edge_id": str(key)}
             )
+    total_nodes = graph.number_of_nodes()
+    isolated_count = sum(1 for n in graph.nodes if graph.degree(n) == 0)
+    isolated_ratio = isolated_count / max(total_nodes, 1)
+    if isolated_ratio > 0.5:
+        logger.warning(
+            "validate_unified_graph: %.1f%% isolated nodes (%d/%d)",
+            isolated_ratio * 100, isolated_count, total_nodes,
+        )
     return {
         "valid": not provisional_nodes and not dangling_edges and not missing_provenance,
-        "nodes": graph.number_of_nodes(),
+        "nodes": total_nodes,
         "edges": graph.number_of_edges(),
         "provisional_nodes": provisional_nodes,
         "dangling_edges": dangling_edges,
         "edges_missing_provenance": missing_provenance,
+        "isolated_nodes": isolated_count,
+        "isolated_ratio": round(isolated_ratio, 4),
     }
 

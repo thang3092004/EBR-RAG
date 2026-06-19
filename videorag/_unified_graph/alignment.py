@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util as _iutil
 import json
 import gc
+import logging
 import re
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 
 def _detect_attn_impl() -> str:
@@ -789,7 +792,13 @@ def run_crossmodal_merge(
                     _call_gpt4o_mini(prompt, CROSSMODAL_MERGE_SYSTEM)
                 )
                 raw_result = _extract_json(raw_response)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "crossmodal_merge batch %d failed (video=%s): %s",
+                    bi, video_id, exc,
+                )
+                if config.get("pipeline_strict", False):
+                    raise
                 raw_result = {"matches": [], "relationships": [], "memory_updates": []}
 
             batch_visual_ids: set[str] = set()
@@ -936,10 +945,19 @@ def run_crossmodal_merge(
                         entry["segments_seen"].append(seg_id)
 
             seg_edges: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            dropped_rels: list[dict[str, str]] = []
             for rel in validated["relationships"]:
                 source = registry.resolve(rel["source"]) or rel["source"]
                 target = registry.resolve(rel["target"]) or rel["target"]
                 if source not in registry.entities or target not in registry.entities:
+                    dropped_rels.append({
+                        "batch": str(bi),
+                        "raw_source": rel["source"],
+                        "raw_target": rel["target"],
+                        "resolved_source": source,
+                        "resolved_target": target,
+                        "predicate": rel.get("predicate", ""),
+                    })
                     continue
                 edge_counter += 1
                 seg_id = rel.get("segment_id", "")
@@ -988,6 +1006,16 @@ def run_crossmodal_merge(
                 mem_entry["relationships"] = mem_entry["relationships"][-10:]
                 if seg_id and seg_id not in mem_entry["segments_seen"]:
                     mem_entry["segments_seen"].append(seg_id)
+
+            if dropped_rels:
+                logger.info(
+                    "batch %d: %d/%d relationships dropped (unresolved IDs)",
+                    bi, len(dropped_rels), len(dropped_rels) + sum(len(v) for v in seg_edges.values()),
+                )
+                drops_path = checkpoint_path / "relationship_drops.jsonl"
+                with open(drops_path, "a", encoding="utf-8") as f:
+                    for d in dropped_rels:
+                        f.write(json.dumps(d, ensure_ascii=False) + "\n")
 
             for seg in batch:
                 seg_id = str(seg["segment_id"])
