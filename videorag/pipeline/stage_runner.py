@@ -85,6 +85,7 @@ class StageDefinition:
     name: str
     dependencies: tuple[str, ...] = ()
     config_keys: tuple[str, ...] = ()
+    preserve_on_restart: tuple[str, ...] = ()
 
 
 @dataclass
@@ -294,7 +295,23 @@ class StageRunner:
         for stage_name in stage_names:
             stage_dir = self.video_dir / stage_name
             if remove_outputs and stage_dir.exists():
-                shutil.rmtree(stage_dir)
+                definition = self.stage_map.get(stage_name)
+                preserve = (
+                    definition.preserve_on_restart if definition else ()
+                )
+                if preserve:
+                    saved: dict[str, bytes] = {}
+                    for pattern in preserve:
+                        for match in stage_dir.rglob(pattern):
+                            if match.is_file():
+                                saved[str(match.relative_to(stage_dir))] = match.read_bytes()
+                    shutil.rmtree(stage_dir)
+                    for rel_path, data in saved.items():
+                        dest = stage_dir / rel_path
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(data)
+                else:
+                    shutil.rmtree(stage_dir)
             state = self.manifest["stages"].setdefault(stage_name, {})
             state.update(
                 {
