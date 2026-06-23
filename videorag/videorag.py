@@ -159,6 +159,10 @@ class VideoRAG:
     correspondence_device: str = "auto"
     disable_visual_identity_linking: bool = False
     disable_crossmodal_alignment: bool = False
+    entity_source: str = "caption"
+    crossmodal_batch_size: int = 8
+    entity_memory_max_context: int = 25
+    extraction_gleaning_rounds: int = 1
     ablation_profile: str = "full_framework"
     unified_graph_namespace: str = "chunk_entity_relation_v2"
     graph_seed_k: int = 4

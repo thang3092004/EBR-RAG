@@ -28,12 +28,6 @@ from .registry import EntityRegistry, normalize_alias
 from .schema import EdgeOccurrence, ProvenanceRecord, bbox_position
 
 
-GENERIC_VISUAL_LABELS = {
-    "person", "animal", "object", "vehicle", "plant",
-    "food", "sports", "outdoor", "indoor",
-}
-
-
 VISUAL_CAPTION_PROMPT = """Describe what is happening in this video segment.
 
 Your description must include:
@@ -48,51 +42,88 @@ Be specific about spatial relationships between entities and their positions.
 """
 
 
-CROSSMODAL_MERGE_SYSTEM = """You are building an entity knowledge graph from a video. \
-You match visual tracked objects to transcript entities, extract relationships, \
-and maintain an accumulative entity memory across batches. Return valid JSON only."""
+# =====================================================================
+# GPT-4o-mini prompts — GraphRAG/LightRAG style unified extraction
+# =====================================================================
+
+GRAPHRAG_SYSTEM = """---Role---
+You are a Knowledge Graph Specialist extracting entities and relationships from video content.
+You receive visual captions (what is seen) and audio transcripts (what is heard) for each video segment.
+You maintain an accumulative entity memory across processing batches.
+Return valid JSON only."""
 
 
-CROSSMODAL_MERGE_PROMPT = """=== KNOWN ENTITIES (accumulated so far) ===
+GRAPHRAG_PROMPT = """---Known Entities---
+Entities accumulated from previous batches. Reuse their EXACT names when encountered again.
+
 {entity_memory_json}
 
-=== VISUAL ENTITIES FROM OBJECT TRACKING (this batch) ===
-{visual_entities_with_positions}
+---Entity Types---
+- Person: Named or role-identified humans (e.g. DAVID ATTENBOROUGH, NARRATOR, RESEARCHER)
+- Animal: Living creatures (e.g. LION, SCARFACE, DOLPHIN). Use SINGULAR form.
+- Object: Physical objects relevant to narrative (e.g. NEST, FISH, ROCK)
+- Location: Geographic places, habitats (e.g. SAVANNA, CORAL REEF, RIVER)
 
-=== TRANSCRIPT ENTITIES (this batch) ===
-{transcript_entities_with_names}
-
-=== SEGMENTS TO PROCESS ===
+---Segments---
 {segments_data}
 
-=== YOUR TASKS ===
+---Task---
+Extract entities and relationships from ALL segments above.
 
-**Task 1 — Entity matching:**
-For each visual entity (V_xxx) that appears in a segment, match it to a transcript
-entity (T_xxx) or known entity from memory, using:
-- Appearance description in the visual caption vs canonical_name
-- Position in frame (V_ entity position vs caption description like "on the left")
-- Temporal co-occurrence (both appear in the same segment timeframe)
+**1. Entity Extraction:**
+For each meaningful entity found in visual captions OR transcripts:
+- "entity_name": Canonical name, CAPITALIZED, SINGULAR. Use specific names from transcript \
+when available (SCARFACE not MONKEY). For unnamed people use roles (NARRATOR, DIVER). \
+If entity matches one in Known Entities, use the EXACT same name.
+- "entity_type": One of [person, animal, object, location]
+- "entity_description": Concise description of appearance, role, distinguishing features. \
+Third person. No pronouns.
+- "source_segments": List of segment IDs where this entity appears
 
-Return matches as a list:
-{{"visual_id": "V_ANIMAL_001", "text_id": "T_ANIMAL_003", "reason": "..."}}
-Use null for text_id if no transcript match is found.
+Do NOT extract: video production elements (the scene, the camera, BBC Earth), \
+abstract concepts (atmosphere, tension).
+If same entity has different names in caption vs transcript, unify under ONE name.
 
-**Task 2 — Relationship extraction:**
-Extract entity relationships and events from each segment.
-Use canonical IDs where known (from matches + memory), provisional IDs otherwise.
-Format each as:
-{{"source": "ANIMAL_001", "predicate": "chased_by", "target": "ANIMAL_015",
-  "segment_id": "SEG_007", "confidence": 0.7,
-  "modalities": ["visual", "transcript"],
-  "description": "predator chases prey at high speed"}}
+**2. Relationship Extraction:**
+For each pair of clearly related entities:
+- "source_entity": Must match an extracted entity name
+- "target_entity": Must match an extracted entity name
+- "predicate": Simple present-tense base verb (chase, attack, inhabit, defend)
+- "keywords": High-level thematic keywords, comma-separated (e.g. "predation, survival")
+- "description": Brief factual explanation
+- "segment_id": Where observed
+- "confidence": 0.0 to 1.0
 
-**Task 3 — Memory update:**
-For each known/matched entity, provide updated description for this batch.
-Format: {{"entity_id": "ANIMAL_001", "new_description": "fleeing from predator (seg7)"}}
+Do NOT create relationships for video editing transitions. Do NOT duplicate relationships.
 
-Return valid JSON with keys: "matches", "relationships", "memory_updates"
+**3. Memory Update:**
+For entities in Known Entities whose state changed:
+- "entity_name": EXACT match from Known Entities
+- "new_description": What is NEW (do not repeat old descriptions)
+
+---Output Format---
+{{
+  "entities": [
+    {{"entity_name": "LION", "entity_type": "animal", "entity_description": "Adult male lion with full mane, dominant predator in the pride", "source_segments": ["SEG_00040", "SEG_00041"]}}
+  ],
+  "relationships": [
+    {{"source_entity": "LION", "target_entity": "BUFFALO", "predicate": "hunt", "keywords": "predation, survival", "description": "The lion stalks and chases the buffalo herd", "segment_id": "SEG_00040", "confidence": 0.9}}
+  ],
+  "memory_updates": [
+    {{"entity_name": "LION", "new_description": "Coordinates group attack on buffalo near the river"}}
+  ]
+}}
 """
+
+
+GLEANING_PROMPT = """MANY entities and relationships may have been missed in the previous extraction.
+Review the same segments again and extract any that were overlooked.
+
+Do NOT re-output entities or relationships already correctly extracted.
+Only output NEW additions or corrections.
+If nothing was missed, return: {{"entities": [], "relationships": [], "memory_updates": []}}
+
+Use the same JSON output format."""
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -281,56 +312,12 @@ class MiniCPMCaptioner:
             pass
 
 
-# ---- keep backward-compatible alias for unified_ingest.py imports ----
 MiniCPMAligner = MiniCPMCaptioner
-
-
-def _visible_entities(
-    segment_id: str,
-    observations: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    by_entity: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for observation in observations:
-        if str(observation.get("segment_id")) == segment_id:
-            by_entity[str(observation["entity_id"])].append(observation)
-    result = []
-    for entity_id, items in by_entity.items():
-        result.append(
-            {
-                "entity_id": entity_id,
-                "entity_type": items[0].get("entity_type", "unknown"),
-                "label": items[0].get("label", ""),
-                "first_seen": min(float(item["time"]) for item in items),
-                "last_seen": max(float(item["time"]) for item in items),
-                "confidence": sum(float(item["confidence"]) for item in items)
-                / max(len(items), 1),
-            }
-        )
-    return sorted(result, key=lambda item: item["entity_id"])
 
 
 def _edge_id(video_id: str, counter: int) -> str:
     safe_video = re.sub(r"[^A-Za-z0-9_-]", "_", video_id)
     return f"EDGE_{safe_video}_{counter:07d}"
-
-
-def _deduplicate_edges(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    deduplicated: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for edge in edges:
-        key = (edge["source"], edge["predicate"], edge["target"])
-        existing = deduplicated.get(key)
-        if existing is None:
-            deduplicated[key] = dict(edge)
-            continue
-        existing["confidence"] = max(
-            float(existing["confidence"]),
-            float(edge["confidence"]),
-        )
-        existing["modalities"] = sorted(
-            set(existing.get("modalities", []))
-            | set(edge.get("modalities", []))
-        )
-    return list(deduplicated.values())
 
 
 # =====================================================================
@@ -444,12 +431,11 @@ def run_visual_captioning(
 
 
 # =====================================================================
-# Sub-step 8b — Cross-modal Entity Merge (GPT-4o-mini, sequential)
+# Sub-step 8b — GPT-4o-mini entity+relationship extraction (GraphRAG style)
 # =====================================================================
 
 def _filter_entity_memory(
     entity_memory: dict[str, Any],
-    active_entity_ids: set[str],
     recent_segment_ids: set[str],
     *,
     global_threshold: int = 5,
@@ -457,11 +443,7 @@ def _filter_entity_memory(
 ) -> dict[str, Any]:
     keep: dict[str, int] = {}
 
-    for eid in active_entity_ids:
-        if eid in entity_memory:
-            keep[eid] = 1
-
-    for eid in list(keep.keys()):
+    for eid in list(entity_memory.keys()):
         for rel_str in entity_memory.get(eid, {}).get("relationships", []):
             parts = rel_str.split()
             if len(parts) >= 2:
@@ -483,200 +465,177 @@ def _filter_entity_memory(
     return {eid: entity_memory[eid] for eid in sorted_eids if eid in entity_memory}
 
 
-def _build_merge_prompt(
+def _build_graphrag_prompt(
     batch_segments: list[dict[str, Any]],
     captions: dict[str, str],
-    visual_entities: list[dict[str, Any]],
-    text_results: dict[str, dict[str, Any]],
-    observations: list[dict[str, Any]],
+    transcripts: dict[str, str],
     entity_memory: dict[str, Any],
     *,
-    transcripts: dict[str, str] | None = None,
     recent_segment_ids: set[str] | None = None,
     max_memory_entities: int = 25,
 ) -> str:
-    from collections import Counter
-
-    transcripts = transcripts or {}
-
-    _active_ids: set[str] = set()
-    for _seg in batch_segments:
-        _sid = str(_seg["segment_id"])
-        for _obs in observations:
-            if str(_obs.get("segment_id")) == _sid:
-                _active_ids.add(str(_obs["entity_id"]))
-        for _mention in text_results.get(_sid, {}).get("mentions", []):
-            _active_ids.add(_mention["text_id"])
-
     filtered_memory = _filter_entity_memory(
         entity_memory,
-        _active_ids,
         recent_segment_ids or set(),
         max_entities=max_memory_entities,
     )
-    entity_memory_json = json.dumps(filtered_memory, ensure_ascii=False) if filtered_memory else "{}"
-
-    ve_position: dict[str, str] = {
-        ve["entity_id"]: ve.get("dominant_position") or "unknown"
-        for ve in visual_entities
-    }
-
-    batch_visual_ids: set[str] = set()
-    for seg in batch_segments:
-        seg_id = str(seg["segment_id"])
-        for obs in observations:
-            if str(obs.get("segment_id")) == seg_id:
-                batch_visual_ids.add(str(obs["entity_id"]))
-
-    v_lines = []
-    for ve in visual_entities:
-        eid = ve["entity_id"]
-        if eid not in batch_visual_ids:
-            continue
-        pos = ve_position.get(eid, "unknown")
-        v_lines.append(
-            f"- {eid}: {ve['entity_type']} ({ve['label']}), "
-            f"dominant position across video: {pos}"
-        )
-    visual_entities_str = "\n".join(v_lines) if v_lines else "(none)"
-
-    t_seen: dict[str, dict[str, Any]] = {}
-    for seg in batch_segments:
-        seg_id = str(seg["segment_id"])
-        for mention in text_results.get(seg_id, {}).get("mentions", []):
-            tid = mention["text_id"]
-            if tid not in t_seen:
-                t_seen[tid] = mention
-
-    t_lines = []
-    for tid, mention in t_seen.items():
-        surface = (
-            mention["occurrences"][0]["text"]
-            if mention.get("occurrences")
-            else mention["label"]
-        )
-        start = mention.get("start", 0.0)
-        t_lines.append(
-            f"- {tid}: label=\"{mention['label']}\", type={mention['entity_type']}, "
-            f"surface_text=\"{surface}\", first_seen={start:.1f}s"
-        )
-    transcript_entities_str = "\n".join(t_lines) if t_lines else "(none)"
+    display_memory: dict[str, Any] = {}
+    for eid, data in filtered_memory.items():
+        key = data.get("canonical_name") or eid
+        if key in display_memory:
+            key = f"{key} ({eid})"
+        display_memory[key] = {
+            "type": data.get("entity_type", ""),
+            "descriptions": data.get("accumulated_descriptions", [])[-3:],
+            "segments_seen": len(data.get("segments_seen", [])),
+        }
+    entity_memory_json = json.dumps(display_memory, ensure_ascii=False) if display_memory else "{}"
 
     segments_data_parts = []
     for seg in batch_segments:
         seg_id = str(seg["segment_id"])
         caption = captions.get(seg_id, "")
-        raw_transcript = transcripts.get(seg_id, "")
-
-        seg_obs_by_entity: dict[str, list[dict[str, Any]]] = {}
-        for obs in observations:
-            if str(obs.get("segment_id")) == seg_id:
-                eid = str(obs["entity_id"])
-                seg_obs_by_entity.setdefault(eid, []).append(obs)
-
-        seg_v_parts = []
-        for eid, obs_list in sorted(seg_obs_by_entity.items()):
-            pos_counts: Counter = Counter()
-            for obs in obs_list:
-                p = bbox_position(obs.get("bbox"))
-                if p:
-                    pos_counts[p] += 1
-            seg_pos = pos_counts.most_common(1)[0][0] if pos_counts else ve_position.get(eid, "unknown")
-            ve_info = next((ve for ve in visual_entities if ve["entity_id"] == eid), {})
-            seg_v_parts.append(
-                f"{eid} ({ve_info.get('label', '?')}, pos_in_segment: {seg_pos})"
-            )
-        seg_v_str = ", ".join(seg_v_parts) if seg_v_parts else "(none)"
-
-        seg_t_parts = []
-        for mention in text_results.get(seg_id, {}).get("mentions", []):
-            surface = (
-                mention["occurrences"][0]["text"]
-                if mention.get("occurrences")
-                else mention["label"]
-            )
-            seg_t_parts.append(
-                f"{mention['text_id']} (\"{surface}\", {mention['entity_type']})"
-            )
-        seg_t_str = ", ".join(seg_t_parts) if seg_t_parts else "(none)"
-
+        transcript = transcripts.get(seg_id, "")
         segments_data_parts.append(
             f"SEGMENT {seg_id} [{seg['start']:.1f}s - {seg['end']:.1f}s]:\n"
             f"Visual caption: {caption}\n"
-            f"Transcript: {raw_transcript}\n"
-            f"Visual entities in this segment: {seg_v_str}\n"
-            f"Transcript entities in this segment: {seg_t_str}"
+            f"Transcript: {transcript}"
         )
     segments_data_str = "\n\n".join(segments_data_parts)
 
-    return CROSSMODAL_MERGE_PROMPT.format(
+    return GRAPHRAG_PROMPT.format(
         entity_memory_json=entity_memory_json,
-        visual_entities_with_positions=visual_entities_str,
-        transcript_entities_with_names=transcript_entities_str,
         segments_data=segments_data_str,
     )
 
 
-def _validate_merge_result(
-    raw: dict[str, Any],
-    visual_ids: set[str],
-    text_ids: set[str],
-    registry_entity_ids: set[str] | None = None,
-) -> dict[str, Any]:
-    registry_entity_ids = registry_entity_ids or set()
-    matches = []
-    for match in raw.get("matches", []):
-        vid = str(match.get("visual_id", "")).strip()
-        tid = match.get("text_id")
-        if tid is not None:
-            tid = str(tid).strip()
-        if vid in visual_ids:
-            if tid is None or tid in text_ids or tid in registry_entity_ids:
-                matches.append({
-                    "visual_id": vid,
-                    "text_id": tid,
-                    "reason": str(match.get("reason", "")),
-                })
+PREDICATE_NORMALIZE = {
+    "chases": "chase", "attacks": "attack", "approaches": "approach",
+    "inhabits": "inhabit", "interacts_with": "interact_with",
+    "observes": "observe", "hunts": "hunt", "stalks": "stalk",
+    "confronts": "confront", "defends": "defend", "flees": "flee",
+    "stands_near": "stand_near", "swims": "swim", "flies": "fly",
+    "fights": "fight", "eats": "eat", "feeds_on": "feed_on",
+    "shares_habitat_with": "share_habitat",
+    "shares_space_with": "share_habitat",
+    "shares_environment_with": "share_habitat",
+    "occupies_space_with": "share_habitat",
+    "forages_for": "forage", "forages_in": "forage",
+    "gathers_around": "gather", "gathers_at": "gather",
+    "engages_with": "engage", "engages_in": "engage",
+    "engages": "engage", "transitions_to": "transition",
+    "displays_similar_behavior": "resemble",
+    "potentially_threatens": "threaten", "potential_threatens": "threaten",
+    "threatens": "threaten",
+}
+
+ENTITY_NAME_NORMALIZE = {
+    "DOLPHINS": "DOLPHIN", "LIONS": "LION", "ANTS": "ANT",
+    "SNAKES": "SNAKE", "SEALS": "SEAL", "WOLVES": "WOLF",
+    "MONKEYS": "MONKEY", "BEARS": "BEAR", "CRABS": "CRAB",
+    "BIRDS": "BIRD", "SHARKS": "SHARK", "OTTERS": "OTTER",
+    "PENGUINS": "PENGUIN", "ELEPHANTS": "ELEPHANT",
+    "HIPPOS": "HIPPO", "HIPPOPOTAMUS": "HIPPO",
+    "KILLER WHALES": "ORCA", "KILLER WHALE": "ORCA",
+    "MONITOR LIZARD": "LACE MONITOR",
+    "REINDEER": "CARIBOU",
+    "WILD BOARS": "WILD BOAR", "BOARS": "WILD BOAR",
+    "SEA LIONS": "SEA LION",
+    "ATLANTIC LOBSTER": "LOBSTER",
+    "ANTOLOPE": "ANTELOPE", "ANTELOPES": "ANTELOPE",
+    "OVIRAPTORID DINOSAUR": "OVIRAPTORID",
+    "HAIR": "HARE",
+}
+
+ENTITY_NOISE = {
+    "BBC EARTH", "SUBMARINE", "THE SCENE", "THE VIDEO",
+    "THE ATMOSPHERE", "THE CAMERA", "THE FOCUS",
+    "THE NARRATOR", "ANIMAL", "OBJECT",
+}
+
+
+def _normalize_entity_name(name: str) -> str:
+    upper = name.strip().upper()
+    return ENTITY_NAME_NORMALIZE.get(upper, upper)
+
+
+def _normalize_predicate(pred: str) -> str:
+    normalized = pred.strip().lower().replace(" ", "_")
+    return PREDICATE_NORMALIZE.get(normalized, normalized)
+
+
+def _validate_graphrag_result(raw: dict[str, Any]) -> dict[str, Any]:
+    entities = []
+    for ent in raw.get("entities", []):
+        name = _normalize_entity_name(str(ent.get("entity_name", "")))
+        if not name or len(name) < 2 or name in ENTITY_NOISE:
+            continue
+        etype = str(ent.get("entity_type", "object")).strip().lower()
+        if etype not in {"person", "animal", "object", "location", "event", "concept"}:
+            etype = "object"
+        if name == "HARE" and etype == "object":
+            etype = "animal"
+        entities.append({
+            "entity_name": name,
+            "entity_type": etype,
+            "entity_description": str(ent.get("entity_description", "")).strip(),
+            "source_segments": [str(s) for s in ent.get("source_segments", [])],
+        })
+
+    seen_entities: dict[str, int] = {}
+    deduped_entities = []
+    for ent in entities:
+        name = ent["entity_name"]
+        if name in seen_entities:
+            existing = deduped_entities[seen_entities[name]]
+            existing["source_segments"] = sorted(
+                set(existing["source_segments"]) | set(ent["source_segments"])
+            )
+            if ent["entity_description"] and not existing["entity_description"]:
+                existing["entity_description"] = ent["entity_description"]
+        else:
+            seen_entities[name] = len(deduped_entities)
+            deduped_entities.append(ent)
 
     relationships = []
     for rel in raw.get("relationships", []):
-        source = str(rel.get("source", "")).strip()
-        target = str(rel.get("target", "")).strip()
-        predicate = str(rel.get("predicate", "")).strip().lower().replace(" ", "_")
+        source = _normalize_entity_name(str(rel.get("source_entity", "")))
+        target = _normalize_entity_name(str(rel.get("target_entity", "")))
+        predicate = _normalize_predicate(str(rel.get("predicate", "")))
         if source and target and predicate and source != target:
+            if source in ENTITY_NOISE or target in ENTITY_NOISE:
+                continue
             relationships.append({
-                "source": source,
-                "target": target,
+                "source_entity": source,
+                "target_entity": target,
                 "predicate": predicate,
+                "keywords": str(rel.get("keywords", "")),
                 "segment_id": str(rel.get("segment_id", "")),
                 "confidence": max(0.0, min(float(rel.get("confidence", 0.5)), 1.0)),
-                "modalities": [
-                    m for m in rel.get("modalities", ["visual", "transcript"])
-                    if m in {"visual", "transcript"}
-                ] or ["visual", "transcript"],
                 "description": str(rel.get("description", "")),
             })
 
     memory_updates = []
     for update in raw.get("memory_updates", []):
-        eid = str(update.get("entity_id", "")).strip()
+        name = _normalize_entity_name(str(update.get("entity_name", "")))
         desc = str(update.get("new_description", "")).strip()
-        if eid and desc:
-            memory_updates.append({"entity_id": eid, "new_description": desc})
+        if name and desc and name not in ENTITY_NOISE:
+            memory_updates.append({"entity_name": name, "new_description": desc})
 
     return {
-        "matches": matches,
+        "entities": deduped_entities,
         "relationships": relationships,
         "memory_updates": memory_updates,
     }
 
 
-async def _call_gpt4o_mini(prompt: str, system_prompt: str) -> str:
+async def _call_gpt4o_mini(prompt: str, system_prompt: str, history_messages=None) -> str:
     from .._llm import openai_complete_if_cache
     return await openai_complete_if_cache(
         "gpt-4o-mini",
         prompt,
         system_prompt=system_prompt,
+        history_messages=history_messages or [],
     )
 
 
@@ -695,9 +654,10 @@ def run_crossmodal_merge(
     progress=None,
     transcripts: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Run cross-modal entity merge using GPT-4o-mini in sequential batches."""
+    """Run GPT-4o-mini entity+relationship extraction in sequential batches."""
     import asyncio
 
+    transcripts = transcripts or {}
     checkpoint_path = Path(checkpoint_dir)
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
@@ -739,28 +699,18 @@ def run_crossmodal_merge(
                         "segment_id": seg_id,
                         "caption": captions.get(seg_id, ""),
                         "edges": [],
-                        "accepted_merges": [],
+                        "entity_ids": [],
                     }
-                    for mention in text_results.get(seg_id, {}).get("mentions", []):
-                        global_id = registry.resolve(mention["text_id"])
-                        if not global_id:
-                            global_id = registry.ensure_entity(
-                                mention["entity_type"],
-                                mention["label"],
-                                source="transcript",
-                                confidence=float(mention.get("confidence", 0.0)),
-                            )
-                            registry.add_alias(
-                                mention["text_id"],
-                                global_id,
-                                source="transcript",
-                                label=mention["label"],
-                                confidence=float(mention.get("confidence", 0.0)),
-                                segment_id=seg_id,
-                            )
-                        _add_mention_provenance(
-                            registry, global_id, mention, video_id, seg_id,
-                        )
+                atomic_write_json(
+                    state_path,
+                    {
+                        "next_batch": bi + 1,
+                        "edge_counter": edge_counter,
+                        "entity_memory": entity_memory,
+                        "registry": registry.to_dict(),
+                        "segment_results": results,
+                    },
+                )
                 if progress is not None:
                     progress.set(
                         sum(len(b) for b in batches[: bi + 1]),
@@ -779,184 +729,100 @@ def run_crossmodal_merge(
                     break
                 _recent_segment_ids.add(str(seg["segment_id"]))
 
-            prompt = _build_merge_prompt(
-                batch, captions, visual_entities, text_results,
-                observations, entity_memory,
-                transcripts=transcripts or {},
+            prompt = _build_graphrag_prompt(
+                batch, captions, transcripts, entity_memory,
                 recent_segment_ids=_recent_segment_ids,
                 max_memory_entities=int(config.get("entity_memory_max_context", 25)),
             )
 
             try:
                 raw_response = loop.run_until_complete(
-                    _call_gpt4o_mini(prompt, CROSSMODAL_MERGE_SYSTEM)
+                    _call_gpt4o_mini(prompt, GRAPHRAG_SYSTEM)
                 )
                 raw_result = _extract_json(raw_response)
             except Exception as exc:
                 logger.warning(
-                    "crossmodal_merge batch %d failed (video=%s): %s",
+                    "graphrag_extract batch %d failed (video=%s): %s",
                     bi, video_id, exc,
                 )
                 if config.get("pipeline_strict", False):
                     raise
-                raw_result = {"matches": [], "relationships": [], "memory_updates": []}
+                raw_result = {"entities": [], "relationships": [], "memory_updates": []}
 
-            batch_visual_ids: set[str] = set()
-            batch_text_ids: set[str] = set()
-            for seg in batch:
-                seg_id = str(seg["segment_id"])
-                for obs in observations:
-                    if str(obs.get("segment_id")) == seg_id:
-                        batch_visual_ids.add(str(obs["entity_id"]))
-                for mention in text_results.get(seg_id, {}).get("mentions", []):
-                    batch_text_ids.add(mention["text_id"])
+            validated = _validate_graphrag_result(raw_result)
 
-            validated = _validate_merge_result(
-                raw_result, batch_visual_ids, batch_text_ids,
-                registry_entity_ids=set(registry.entities.keys()),
-            )
-
-            for match in validated["matches"]:
-                if match["text_id"] is None:
-                    continue
-                mention = None
-                for seg in batch:
-                    seg_id = str(seg["segment_id"])
-                    for m in text_results.get(seg_id, {}).get("mentions", []):
-                        if m["text_id"] == match["text_id"]:
-                            mention = m
-                            break
-                    if mention:
+            # ---- Gleaning: retry to catch missed entities (LightRAG pattern) ----
+            max_gleaning = int(config.get("extraction_gleaning_rounds", 1))
+            for gleaning_round in range(max_gleaning):
+                if not validated["entities"] and not validated["relationships"]:
+                    break
+                try:
+                    gleaning_resp = loop.run_until_complete(
+                        _call_gpt4o_mini(
+                            GLEANING_PROMPT,
+                            GRAPHRAG_SYSTEM,
+                            history_messages=[
+                                {"role": "user", "content": prompt},
+                                {"role": "assistant", "content": raw_response},
+                            ],
+                        )
+                    )
+                    gleaning_result = _extract_json(gleaning_resp)
+                    gleaning_valid = _validate_graphrag_result(gleaning_result)
+                    if not gleaning_valid["entities"] and not gleaning_valid["relationships"]:
                         break
-                if mention:
-                    registry.add_alias(
-                        match["text_id"],
-                        match["visual_id"],
-                        source="crossmodal_merge",
-                        label=mention["label"],
-                        confidence=float(mention.get("confidence", 0.0)),
-                        segment_id=seg_id,
+                    existing_names = {e["entity_name"] for e in validated["entities"]}
+                    for ent in gleaning_valid["entities"]:
+                        if ent["entity_name"] not in existing_names:
+                            validated["entities"].append(ent)
+                            existing_names.add(ent["entity_name"])
+                    validated["relationships"].extend(gleaning_valid["relationships"])
+                    validated["memory_updates"].extend(gleaning_valid["memory_updates"])
+                except Exception:
+                    break
+
+            # ---- Register extracted entities ----
+            for ent in validated["entities"]:
+                existing_id = registry.resolve(ent["entity_name"])
+                if existing_id:
+                    global_id = existing_id
+                else:
+                    global_id = registry.ensure_entity(
+                        ent["entity_type"],
+                        ent["entity_name"],
+                        source="gpt4o_mini",
+                        confidence=0.7,
                     )
-                    node = registry.entities.get(match["visual_id"])
-                    if node and mention.get("label"):
-                        if (
-                            node.canonical_name in GENERIC_VISUAL_LABELS
-                            or node.canonical_name == node.entity_id
-                        ):
-                            node.canonical_name = mention["label"]
-                    if match["visual_id"] in entity_memory and mention.get("label"):
-                        entity_memory[match["visual_id"]]["canonical_name"] = mention["label"]
-
-                if mention is None and match["text_id"] in registry.entities:
-                    memory_node = registry.entities[match["text_id"]]
-                    vis_node = registry.entities.get(match["visual_id"])
-                    if vis_node:
-                        registry.add_alias(
-                            match["text_id"],
-                            match["visual_id"],
-                            source="crossmodal_merge",
-                            label=memory_node.canonical_name or vis_node.canonical_name,
-                            confidence=0.7,
-                            segment_id=str(batch[0]["segment_id"]),
-                        )
-                        old_mem = entity_memory.pop(match["text_id"], None)
-                        if old_mem:
-                            new_mem = entity_memory.setdefault(match["visual_id"], {
-                                "canonical_name": "",
-                                "accumulated_descriptions": [],
-                                "relationships": [],
-                                "segments_seen": [],
-                            })
-                            new_mem["accumulated_descriptions"] = (
-                                old_mem.get("accumulated_descriptions", [])
-                                + new_mem["accumulated_descriptions"]
-                            )[-10:]
-                            for r in old_mem.get("relationships", []):
-                                if r not in new_mem["relationships"]:
-                                    new_mem["relationships"].append(r)
-                            new_mem["relationships"] = new_mem["relationships"][-10:]
-                            for s in old_mem.get("segments_seen", []):
-                                if s not in new_mem["segments_seen"]:
-                                    new_mem["segments_seen"].append(s)
-                    if (
-                        vis_node
-                        and memory_node.canonical_name
-                        and memory_node.canonical_name not in GENERIC_VISUAL_LABELS
-                        and memory_node.canonical_name != vis_node.entity_id
-                    ):
-                        if (
-                            vis_node.canonical_name in GENERIC_VISUAL_LABELS
-                            or vis_node.canonical_name == vis_node.entity_id
-                        ):
-                            vis_node.canonical_name = memory_node.canonical_name
-                        if match["visual_id"] in entity_memory:
-                            entity_memory[match["visual_id"]]["canonical_name"] = (
-                                memory_node.canonical_name
-                            )
-
-            for seg in batch:
-                seg_id = str(seg["segment_id"])
-                for mention in text_results.get(seg_id, {}).get("mentions", []):
-                    global_id = registry.resolve(mention["text_id"])
-                    if not global_id:
-                        global_id = registry.ensure_entity(
-                            mention["entity_type"],
-                            mention["label"],
-                            source="transcript",
-                            confidence=float(mention.get("confidence", 0.0)),
-                        )
-                        registry.add_alias(
-                            mention["text_id"],
-                            global_id,
-                            source="transcript",
-                            label=mention["label"],
-                            confidence=float(mention.get("confidence", 0.0)),
-                            segment_id=seg_id,
-                        )
-                    _add_mention_provenance(
-                        registry, global_id, mention, video_id, seg_id,
-                    )
-
-            for update in validated["memory_updates"]:
-                eid = update["entity_id"]
-                canonical = registry.resolve(eid) or eid
-                entry = entity_memory.setdefault(canonical, {
-                    "canonical_name": "",
+                mem = entity_memory.setdefault(global_id, {
+                    "canonical_name": ent["entity_name"],
+                    "entity_type": ent["entity_type"],
                     "accumulated_descriptions": [],
                     "relationships": [],
                     "segments_seen": [],
                 })
-                node = registry.entities.get(canonical)
-                if node:
-                    entry["canonical_name"] = node.canonical_name
-                entry["accumulated_descriptions"].append(update["new_description"])
-                entry["accumulated_descriptions"] = entry["accumulated_descriptions"][-10:]
-                for seg in batch:
-                    seg_id = str(seg["segment_id"])
-                    seg_has_entity = any(
-                        str(obs.get("entity_id")) == canonical
-                        for obs in observations
-                        if str(obs.get("segment_id")) == seg_id
-                    ) or any(
-                        m["text_id"] == eid or registry.resolve(m["text_id"]) == canonical
-                        for m in text_results.get(seg_id, {}).get("mentions", [])
-                    )
-                    if seg_has_entity and seg_id not in entry["segments_seen"]:
-                        entry["segments_seen"].append(seg_id)
+                mem["canonical_name"] = ent["entity_name"]
+                mem["entity_type"] = ent["entity_type"]
+                if ent["entity_description"]:
+                    mem["accumulated_descriptions"].append(ent["entity_description"])
+                    mem["accumulated_descriptions"] = mem["accumulated_descriptions"][-10:]
+                for sid in ent.get("source_segments", []):
+                    if sid and sid not in mem["segments_seen"]:
+                        mem["segments_seen"].append(sid)
 
+            # ---- Process relationships ----
             seg_edges: dict[str, list[dict[str, Any]]] = defaultdict(list)
             dropped_rels: list[dict[str, str]] = []
             for rel in validated["relationships"]:
-                source = registry.resolve(rel["source"]) or rel["source"]
-                target = registry.resolve(rel["target"]) or rel["target"]
-                if source not in registry.entities or target not in registry.entities:
+                source = registry.resolve(rel["source_entity"])
+                target = registry.resolve(rel["target_entity"])
+                if not source or not target:
                     dropped_rels.append({
                         "batch": str(bi),
-                        "raw_source": rel["source"],
-                        "raw_target": rel["target"],
-                        "resolved_source": source,
-                        "resolved_target": target,
-                        "predicate": rel.get("predicate", ""),
+                        "raw_source": rel["source_entity"],
+                        "raw_target": rel["target_entity"],
+                        "resolved_source": source or "",
+                        "resolved_target": target or "",
+                        "predicate": rel["predicate"],
                     })
                     continue
                 edge_counter += 1
@@ -974,11 +840,11 @@ def run_crossmodal_merge(
                     end=float(seg_for_time["end"]),
                     segment_id=seg_id,
                     confidence=float(rel["confidence"]),
-                    modalities=rel["modalities"],
-                    description=rel.get("description", ""),
+                    modalities=["visual", "transcript"],
+                    description=f"{rel.get('description', '')} [{rel.get('keywords', '')}]".strip(),
                     provenance=[
                         ProvenanceRecord(
-                            source="gpt4o_mini_crossmodal",
+                            source="gpt4o_mini_graphrag",
                             video_id=video_id,
                             segment_id=seg_id,
                             start=float(seg_for_time["start"]),
@@ -1017,6 +883,21 @@ def run_crossmodal_merge(
                     for d in dropped_rels:
                         f.write(json.dumps(d, ensure_ascii=False) + "\n")
 
+            # ---- Process memory updates ----
+            for update in validated["memory_updates"]:
+                resolved = registry.resolve(update["entity_name"])
+                if not resolved:
+                    continue
+                entry = entity_memory.setdefault(resolved, {
+                    "canonical_name": update["entity_name"],
+                    "accumulated_descriptions": [],
+                    "relationships": [],
+                    "segments_seen": [],
+                })
+                entry["accumulated_descriptions"].append(update["new_description"])
+                entry["accumulated_descriptions"] = entry["accumulated_descriptions"][-10:]
+
+            # ---- Build segment results ----
             for seg in batch:
                 seg_id = str(seg["segment_id"])
                 edges = seg_edges.get(seg_id, [])
@@ -1030,10 +911,6 @@ def run_crossmodal_merge(
                     "caption": captions.get(seg_id, ""),
                     "edges": edges,
                     "entity_ids": entity_ids,
-                    "accepted_merges": [
-                        m for m in validated["matches"]
-                        if m["text_id"] is not None
-                    ],
                 }
 
             atomic_write_json(
@@ -1065,38 +942,6 @@ def run_crossmodal_merge(
     }
 
 
-def _add_mention_provenance(
-    registry: EntityRegistry,
-    global_id: str,
-    mention: dict[str, Any],
-    video_id: str,
-    segment_id: str,
-) -> None:
-    occurrences = mention.get("occurrences") or [
-        {
-            "start": mention["start"],
-            "end": mention["end"],
-            "text": mention["label"],
-            "confidence": mention.get("confidence", 0.0),
-        }
-    ]
-    for occurrence in occurrences:
-        registry.add_provenance(
-            global_id,
-            ProvenanceRecord(
-                source="transcript",
-                video_id=video_id,
-                segment_id=segment_id,
-                start=float(occurrence["start"]),
-                end=float(occurrence["end"]),
-                text=str(occurrence.get("text", mention["label"])),
-                confidence=float(
-                    occurrence.get("confidence", mention.get("confidence", 0.0))
-                ),
-            ),
-        )
-
-
 # =====================================================================
 # Main entry point — align_all_segments (8a + 8b combined)
 # =====================================================================
@@ -1116,13 +961,11 @@ def align_all_segments(
     visual_entities: list[dict[str, Any]] | None = None,
     loop=None,
     transcripts: dict[str, str] | None = None,
-    # legacy kwargs kept for backward compat — ignored
     correspondence_encoder=None,
 ) -> dict[str, Any]:
     checkpoint_path = Path(checkpoint_dir)
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
-    # ---- Sub-step 8a: MiniCPM visual captioning ----
     captions = run_visual_captioning(
         video_id,
         segments,
@@ -1135,7 +978,6 @@ def align_all_segments(
     if aligner is not None:
         aligner.close()
 
-    # ---- Sub-step 8b: GPT-4o-mini cross-modal merge ----
     result = run_crossmodal_merge(
         video_id,
         segments,

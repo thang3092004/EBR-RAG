@@ -227,6 +227,7 @@ def fixed_segment(
                 "duration": float(end - start),
                 "context_start": max(0.0, float(start) - context),
                 "context_end": min(duration, float(end) + context),
+                "has_shot_at_start": False,
             }
         )
         start = end

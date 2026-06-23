@@ -113,6 +113,7 @@ UNIFIED_STAGE_DEFINITIONS = [
             "disable_crossmodal_alignment",
             "entity_source",
             "caption_alias_similarity_threshold",
+            "extraction_gleaning_rounds",
             "pipeline_strict",
         ),
         preserve_on_restart=("captions.json",),

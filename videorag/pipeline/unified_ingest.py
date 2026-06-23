@@ -469,6 +469,24 @@ class UnifiedIngestPipeline:
         runner: StageRunner,
         video_id: str,
     ) -> dict[str, Any]:
+        if self.config.get("entity_source", "caption") == "caption":
+            registry = _new_video_registry(self.vrag.working_dir)
+            context.write_json("observations.json", [])
+            context.write_json("tracklets.json", [])
+            context.write_json("visual_entities.json", [])
+            context.write_json("registry.json", registry.to_dict())
+            context.write_json("appearance_report.json", {
+                "available": False, "reason": "caption_mode",
+            })
+            context.report_metrics(
+                observations=0, tracklets=0, visual_entities=0,
+                appearance_backend="caption_mode",
+                identity_linking=False,
+            )
+            return {
+                "observations": 0, "tracklets": 0, "visual_entities": 0,
+                "appearance": {"available": False, "reason": "caption_mode"},
+            }
         probe = read_json(runner.output("probe", "probe.json"))
         segments = read_json(runner.output("segmentation", "segments.json"))
         with context.progress(
@@ -591,6 +609,21 @@ class UnifiedIngestPipeline:
         }
 
     def _stage_text(self, context, runner: StageRunner) -> dict[str, Any]:
+        if self.config.get("entity_source", "caption") == "caption":
+            context.write_json("text_entities.json", {})
+            context.write_json("text_memory.json", {})
+            context.report_metrics(
+                backend="skipped_caption_mode",
+                mentions=0,
+                resolved_references=0,
+                unresolved_references=0,
+            )
+            return {
+                "output": str(context.path("text_entities.json")),
+                "backend": "skipped_caption_mode",
+                "resolved_references": 0,
+                "unresolved_references": 0,
+            }
         segments = read_json(runner.output("segmentation", "segments.json"))
         asr = read_json(runner.output("asr", "asr.json"))
         by_segment = assign_words_to_segments(
@@ -690,16 +723,6 @@ class UnifiedIngestPipeline:
         text_results = read_json(
             runner.output("text_entities", "text_entities.json")
         )
-        observations = read_json(
-            runner.output("tracking_base", "observations.json")
-        )
-        visual_entities_list = read_json(
-            runner.output("tracking_base", "visual_entities.json"),
-            [],
-        )
-        registry = EntityRegistry(
-            read_json(runner.output("tracking_base", "registry.json"))
-        )
         asr = read_json(runner.output("asr", "asr.json"))
         by_segment = assign_words_to_segments(asr["words"], segments)
         transcripts: dict[str, str] = {
@@ -712,6 +735,14 @@ class UnifiedIngestPipeline:
             )
             for seg in segments
         }
+
+        observations = read_json(
+            runner.output("tracking_base", "observations.json"), [],
+        )
+        registry = EntityRegistry(
+            read_json(runner.output("tracking_base", "registry.json"), {})
+        )
+
         if (
             getattr(self.vrag, "caption_model", None) is None
             or getattr(self.vrag, "caption_tokenizer", None) is None
@@ -722,13 +753,11 @@ class UnifiedIngestPipeline:
             model=getattr(self.vrag, "caption_model", None),
             tokenizer=getattr(self.vrag, "caption_tokenizer", None),
         )
-        crossmodal_enabled = not bool(
-            self.config.get("disable_crossmodal_alignment", False)
-        )
+
         with context.progress(
             total=len(segments),
             unit="seg",
-            description="Visual caption + cross-modal merge",
+            description="Caption + entity extraction",
         ) as progress:
             result = align_all_segments(
                 video_id,
@@ -741,11 +770,9 @@ class UnifiedIngestPipeline:
                 context.path("segments"),
                 progress=progress,
                 aligner=captioner,
-                visual_entities=visual_entities_list,
                 loop=self.loop,
                 transcripts=transcripts,
             )
-        context.write_json("alignment.json", result)
         stale_entity_ids = _merge_global_registry(
             self.vrag.working_dir,
             video_id,
@@ -759,7 +786,6 @@ class UnifiedIngestPipeline:
             caption_model="MiniCPM-V-2_6-int4",
             merge_model="gpt-4o-mini",
             stale_entities=len(stale_entity_ids),
-            crossmodal_alignment=crossmodal_enabled,
         )
         return {
             "output": str(context.path("alignment.json")),
@@ -820,10 +846,12 @@ class UnifiedIngestPipeline:
                 else ""
             )
             caption = aligned.get("caption", "")
-            content = (
-                f"{entity_memory}\nCaption:\n{caption}\n"
-                f"Transcript:\n{original_transcript}\n"
-            ).strip()
+            parts = []
+            if entity_memory:
+                parts.append(entity_memory)
+            parts.append(f"Caption:\n{caption}")
+            parts.append(f"Transcript:\n{original_transcript}")
+            content = "\n\n".join(parts)
             payload[str(segment["index"])] = {
                 "content": content,
                 "time": f"{segment['start']:.3f}-{segment['end']:.3f}",
