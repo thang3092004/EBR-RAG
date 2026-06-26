@@ -28,17 +28,16 @@ from .registry import EntityRegistry, normalize_alias
 from .schema import EdgeOccurrence, ProvenanceRecord, bbox_position
 
 
-VISUAL_CAPTION_PROMPT = """Describe what is happening in this video segment.
+VISUAL_CAPTION_PROMPT = """Describe what is visible in this video segment in 2-4 concise sentences.
 
-Your description must include:
-1. All events and actions occurring in the scene
-2. The overall context and atmosphere
-3. For each visible person or distinct object, describe:
-   - Appearance (clothing color, size, distinguishing features)
-   - Position in frame (e.g. "standing on the left", "in the foreground center")
-   - What they are doing
-
-Be specific about spatial relationships between entities and their positions.
+Rules:
+- State FACTS only: who/what is visible, what they are doing, where.
+- Do NOT speculate or hedge (no "possibly", "suggesting", "likely", "indicating").
+- Do NOT describe mood, atmosphere, or make interpretive comments.
+- Do NOT start with "The video segment shows/captures/depicts".
+- Use specific names if visible in text overlays or recognizable (e.g. species names).
+- For each distinct person or animal: note appearance and position in frame.
+- Maximum 100 words.
 """
 
 
@@ -653,6 +652,7 @@ def run_crossmodal_merge(
     loop=None,
     progress=None,
     transcripts: dict[str, str] | None = None,
+    initial_entity_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run GPT-4o-mini entity+relationship extraction in sequential batches."""
     import asyncio
@@ -669,6 +669,8 @@ def run_crossmodal_merge(
         else initial_registry
     )
     entity_memory: dict[str, Any] = dict(state.get("entity_memory", {}))
+    if not entity_memory and initial_entity_memory:
+        entity_memory = dict(initial_entity_memory)
     next_batch = int(state.get("next_batch", 0))
     edge_counter = int(state.get("edge_counter", 0))
 
@@ -786,6 +788,14 @@ def run_crossmodal_merge(
                 existing_id = registry.resolve(ent["entity_name"])
                 if existing_id:
                     global_id = existing_id
+                    if global_id not in registry.entities:
+                        registry.ensure_entity(
+                            ent["entity_type"],
+                            ent["entity_name"],
+                            entity_id=global_id,
+                            source="cross_video",
+                            confidence=0.7,
+                        )
                 else:
                     global_id = registry.ensure_entity(
                         ent["entity_type"],
@@ -961,6 +971,7 @@ def align_all_segments(
     visual_entities: list[dict[str, Any]] | None = None,
     loop=None,
     transcripts: dict[str, str] | None = None,
+    initial_entity_memory: dict[str, Any] | None = None,
     correspondence_encoder=None,
 ) -> dict[str, Any]:
     checkpoint_path = Path(checkpoint_dir)
@@ -991,6 +1002,7 @@ def align_all_segments(
         loop=loop,
         progress=progress,
         transcripts=transcripts,
+        initial_entity_memory=initial_entity_memory,
     )
 
     return result

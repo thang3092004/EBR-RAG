@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /usr /opt /workspace ~/.local -name \"python3*\" -type f 2>/dev/null | grep -v __pycache__ | head -20 && find / -name \"torch\" -type d 2>/dev/null | head -10)",
+      "Read(//usr/**)",
+      "Bash(/workspace/EBR-RAG/.venv/bin/python -c \"import torch; print\\(torch.__version__\\)\")",
+      "Bash(/workspace/EBR-RAG/.venv/bin/python -m pip install flash-attn --no-build-isolation)",
+      "Bash(/workspace/EBR-RAG/.venv/bin/python -c \"from flash_attn import flash_attn_func; print\\('flash-attn OK:', flash_attn_func\\)\")",
+      "Bash(/workspace/EBR-RAG/.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python reproduce/run_ablation_matrix.py --help)",
+      "Bash(find /workspace /root -name \"faster-distil-whisper*\" -o -name \"faster_distil_whisper*\" 2>/dev/null | grep -v __pycache__ | head -10)",
+      "Read(//workspace/**)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(python3 -c ' *)",
+      "Bash(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader)",
+      "Bash(nvidia-smi)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
+    ]
+  }
+}

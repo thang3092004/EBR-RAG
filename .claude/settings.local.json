@@ -3,7 +3,11 @@
     "allow": [
       "Bash(powershell *)",
       "Bash(where yt-dlp *)",
-      "Bash(grep -rn \"\\\\.pt\\\\|\\\\.bin\\\\|\\\\.model\\\\|hardcoded\\\\|/path/\\\\|C:\\\\\\\\\\\\\\\\\" videorag/ --include=\"*.py\")"
+      "Bash(grep -rn \"\\\\.pt\\\\|\\\\.bin\\\\|\\\\.model\\\\|hardcoded\\\\|/path/\\\\|C:\\\\\\\\\\\\\\\\\" videorag/ --include=\"*.py\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(f'{k:25s} {d[\\\\\"stages\\\\\"][k][\\\\\"status\\\\\"]}'\\) for k in d['stages']]\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(python3 -c ' *)"
     ]
   }
 }

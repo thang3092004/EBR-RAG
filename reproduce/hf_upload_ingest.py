@@ -21,6 +21,11 @@ def main():
         help="Hugging Face dataset repo id",
     )
     parser.add_argument(
+        "--artifacts-only",
+        action="store_true",
+        help="Skip pipeline_v2/ (intermediate stage data). Only upload query-time artifacts (~310MB vs 5GB).",
+    )
+    parser.add_argument(
         "--source-root",
         default="longervideos/videorag-workdir",
         help="Root folder containing ingested workdirs",
@@ -54,7 +59,11 @@ def main():
                 repo_id=args.repo_id,
                 repo_type="dataset",
                 path_in_repo=folder.name,
-                ignore_patterns=["**/_cache/**", "**/.git/**"], # Skip heavy cache files
+                ignore_patterns=[
+                    "**/_cache/**",
+                    "**/.git/**",
+                    *(["**/pipeline_v2/**"] if args.artifacts_only else []),
+                ],
             )
 
     print(f"\n✅ Uploaded all ingested data for collections: {', '.join(args.collections)}")

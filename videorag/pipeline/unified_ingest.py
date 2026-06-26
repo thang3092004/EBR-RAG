@@ -78,7 +78,9 @@ def _load_global_registry(working_dir: str | Path) -> EntityRegistry:
 
 def _new_video_registry(working_dir: str | Path) -> EntityRegistry:
     global_registry = _load_global_registry(working_dir)
-    return EntityRegistry({"counters": dict(global_registry.counters), "entities": []})
+    registry = EntityRegistry({"counters": dict(global_registry.counters), "entities": []})
+    registry.name_to_global = dict(global_registry.name_to_global)
+    return registry
 
 
 def _merge_global_registry(
@@ -742,6 +744,12 @@ class UnifiedIngestPipeline:
         registry = EntityRegistry(
             read_json(runner.output("tracking_base", "registry.json"), {})
         )
+        global_registry = _load_global_registry(self.vrag.working_dir)
+        registry.name_to_global.update(global_registry.name_to_global)
+        global_memory_path = (
+            Path(self.vrag.working_dir) / "pipeline_v2" / "global_entity_memory.json"
+        )
+        initial_entity_memory = read_json(global_memory_path, {})
 
         if (
             getattr(self.vrag, "caption_model", None) is None
@@ -772,7 +780,9 @@ class UnifiedIngestPipeline:
                 aligner=captioner,
                 loop=self.loop,
                 transcripts=transcripts,
+                initial_entity_memory=initial_entity_memory,
             )
+        atomic_write_json(global_memory_path, result.get("entity_memory", {}))
         stale_entity_ids = _merge_global_registry(
             self.vrag.working_dir,
             video_id,
