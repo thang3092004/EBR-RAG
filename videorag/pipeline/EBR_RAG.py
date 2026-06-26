@@ -199,22 +199,22 @@ async def EBR_RAG_answer(vrag, query: str, param) -> dict:
     debate_cfg = DebateConfig(
         model=model_name,
         max_rounds=max_rounds,
-        tool_top_k=1, # Defender retrieves 1 item per call
+        tool_top_k=3,
         max_tool_calls_per_round=int(
-            getattr(param, "max_tool_calls_per_round", 2)
+            getattr(param, "max_tool_calls_per_round", 3)
         ),
-        max_total_tool_calls=int(getattr(param, "max_total_tool_calls", 4)),
+        max_total_tool_calls=int(getattr(param, "max_total_tool_calls", 6)),
         max_evidence=universal_cap,
         critique_see_evidence=getattr(param, "debate_critique_see_evidence", False),
         defender_disable_tools=getattr(param, "debate_defender_disable_tools", False),
         single_hypothesis=getattr(param, "debate_single_hypothesis", False),
+        disable_early_stopping=getattr(param, "debate_disable_early_stopping", False),
     )
 
     # --- Tool dispatcher ---
     async def dispatch_tool(name: str, args: dict, evidence_pool: list[EvidenceItem]) -> dict:
         q: str = args.get("query", query)
-        # Unified limit: 1 item per call during debate
-        tk = 1
+        tk = min(int(args.get("top_k", 3)), 5)
         
         call_config = dict(global_config)
         call_config["retrieval_topk_chunks"] = tk

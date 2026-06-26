@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 
 EvidenceType = Literal["text", "entity", "segment", "graph"]
 
@@ -32,3 +32,15 @@ class EvidenceItem:
             "validated": self.validated,
             "metadata": self.metadata,
         }
+
+
+@dataclass
+class CritiqueOutput:
+    """Structured output from Critique agent — used for early stopping."""
+    flaws: List[dict] = field(default_factory=list)
+    overall_assessment: str = "adequate"
+    raw_text: str = ""
+
+    @property
+    def has_significant_flaws(self) -> bool:
+        return any(f.get("severity") in ("critical", "moderate") for f in self.flaws)

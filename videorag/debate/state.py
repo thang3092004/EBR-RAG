@@ -7,14 +7,15 @@ from .evidence_types import EvidenceItem
 class DebateConfig:
     model: str = "gpt-4o-mini"
     max_rounds: int = 2
-    tool_top_k: int = 1
-    max_tool_calls_per_round: int = 2
-    max_total_tool_calls: int = 4
+    tool_top_k: int = 3
+    max_tool_calls_per_round: int = 3
+    max_total_tool_calls: int = 6
     max_evidence: int = 16
     # Ablation flags
     critique_see_evidence: bool = False
     defender_disable_tools: bool = False
     single_hypothesis: bool = False
+    disable_early_stopping: bool = False
 
 
 @dataclass

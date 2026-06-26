@@ -17,7 +17,7 @@ from typing import List, Callable, Any
 from ..agents import agents_prompts
 from ..agents.roles import ROLE_CONFIGS, RoleConfig
 from ..debate.state import DebateConfig, DebateState
-from ..debate.evidence_types import EvidenceItem
+from ..debate.evidence_types import EvidenceItem, CritiqueOutput
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from openai import RateLimitError, APIConnectionError, BadRequestError
 
@@ -175,16 +175,17 @@ async def _run_critique(
 ) -> str:
     """Attack the latest draft, blinded unless the ablation flag exposes evidence."""
     r_cfg: RoleConfig = role_cfgs.get("critique", RoleConfig(model=cfg.model))
-    
-    # We pass the history so the critique knows what was already addressed
+
     history_str = json.dumps(_compact_transcript(debate_history, limit=10), ensure_ascii=False)
-    prompt_base = agents_prompts.CRITIQUE_PROMPT_MCQ if is_mcq else agents_prompts.CRITIQUE_PROMPT_OPEN
-    
-    evidence_section = ""
+
+    # A7 ablation: Critique sees evidence → use different prompt
     if cfg.critique_see_evidence:
-        evidence_section = (
-            f"\n\nEvidence Pool:\n{_format_evidence(evidence or [])}"
-        )
+        prompt_base = agents_prompts.CRITIQUE_PROMPT_MCQ_WITH_EVIDENCE if is_mcq else agents_prompts.CRITIQUE_PROMPT_OPEN_WITH_EVIDENCE
+        evidence_section = f"\n\nEvidence Pool:\n{_format_evidence(evidence or [])}"
+    else:
+        prompt_base = agents_prompts.CRITIQUE_PROMPT_MCQ if is_mcq else agents_prompts.CRITIQUE_PROMPT_OPEN
+        evidence_section = ""
+
     local_msgs = [
         {"role": "system", "content": prompt_base},
         {"role": "user", "content": (
@@ -192,7 +193,7 @@ async def _run_critique(
             f"Current Draft/Analysis:\n{current_draft}\n\n"
             f"Refinement History (last 10 messages):\n{history_str}"
             f"{evidence_section}\n\n"
-            "Analyze the draft for flaws, gaps, or hallucinations. Provide your list of flaws."
+            "Provide your numbered list of gaps/issues."
         )},
     ]
     resp = await _chat(
@@ -406,20 +407,32 @@ async def run_debate(
             "content": f"[Critique Round {round_num + 1}] {critique_feedback}"
         })
 
+        # Early stopping: parse critique for significant flaws
+        if not cfg.disable_early_stopping:
+            _critique_lower = critique_feedback.lower()
+            _has_critical = any(w in _critique_lower for w in ["critical", "major flaw", "fundamental"])
+            _has_moderate = any(w in _critique_lower for w in ["omission", "missing", "overreach", "vague"])
+            if not _has_critical and not _has_moderate and len(critique_feedback) < 200:
+                logger.info(f"[Refinement] Early stop at round {round_num + 1}: no significant flaws detected")
+                state.metadata["early_stopped"] = True
+                state.metadata["early_stop_round"] = round_num + 1
+                break
+
         # 2. Defender refines the draft based on feedback
         refiner_output = await _refine_draft(
             query, current_draft, critique_feedback, state, llm_client, tools, dispatch_tool, cfg, role_cfgs, is_mcq
         )
         
-        # Defender output is expected to have "Updated Draft" section
-        # We try to extract the new draft for the next round
-        if "Updated Draft" in refiner_output:
-            try:
-                new_draft = refiner_output.split("Updated Draft")[-1].strip(": \n")
-                if len(new_draft) > 50: # Sanity check
-                    current_draft = new_draft
-            except:
-                pass
+        # Extract updated draft from Defender output (3-tier: regex → full output → keep old)
+        import re
+        _draft_match = re.search(
+            r'(?:Updated\s+Draft|Updated\s+MCQ\s+Analysis|UPDATED\s+DRAFT)[:\s]*\n(.*)',
+            refiner_output, re.DOTALL | re.IGNORECASE
+        )
+        if _draft_match and len(_draft_match.group(1).strip()) > 50:
+            current_draft = _draft_match.group(1).strip()
+        elif len(refiner_output.strip()) > 50 and refiner_output.strip() != current_draft:
+            current_draft = refiner_output.strip()
         
         state.transcript.append({
             "role": "assistant",

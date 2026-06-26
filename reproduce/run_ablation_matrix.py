@@ -46,8 +46,8 @@ DEFAULT_INGESTION_PROFILES = (
     BASELINE_SCENARIO,
     FULL_SCENARIO,
     "no_adaptive_segmentation",
-    "no_transcript_memory",
-    "no_visual_identity_linking",
+    "no_entity_memory",
+    "no_gleaning",
     "no_crossmodal_alignment",
 )
 DEFAULT_QUERY_SCENARIOS = tuple(QUERY_SCENARIOS)
@@ -57,40 +57,32 @@ REUSABLE_FULL_STAGES = {
         "asr",
         "shot_detection",
     ),
-    "no_transcript_memory": (
+    "no_entity_memory": (
         "probe",
         "asr",
         "shot_detection",
         "segmentation",
-        "tracking_base",
         "frame_selection",
     ),
-    "no_visual_identity_linking": (
+    "no_gleaning": (
         "probe",
         "asr",
         "shot_detection",
         "segmentation",
-        "text_entities",
+        "frame_selection",
     ),
     "no_crossmodal_alignment": (
         "probe",
         "asr",
         "shot_detection",
         "segmentation",
-        "tracking_base",
         "frame_selection",
-        "text_entities",
     ),
 }
 
 # Profiles whose visual captioning (Pass 1) output is identical to A1's.
 # visual_pass.json is seeded from full_framework workdir so Pass 1 is skipped.
-VISUAL_PASS_REUSABLE_PROFILES = {"no_transcript_memory", "no_crossmodal_alignment"}
-
-# Profiles that must re-run tracking_base (different config hash) but whose
-# YOLO chunk files are identical to A1's — only link_visual_tracklets differs.
-# Pre-seeding chunks/ lets the stage skip YOLO and only run fast post-processing.
-TRACKING_CHUNK_REUSABLE_PROFILES = {"no_visual_identity_linking"}
+VISUAL_PASS_REUSABLE_PROFILES = {"no_entity_memory", "no_gleaning"}
 
 
 def _utc_now() -> str:
@@ -258,24 +250,6 @@ def _seed_profile_from_full(
                 if not dst_vpass.exists():
                     _hardlink_or_copy(str(src_vpass), str(dst_vpass))
 
-        # Seed YOLO chunks for profiles that re-run tracking_base with different
-        # config (different hash → stage cannot be marked done) but whose YOLO
-        # output is identical to A1's. The stage runner skips YOLO inference when
-        # chunk files already exist, then runs only the fast post-processing steps.
-        if profile in TRACKING_CHUNK_REUSABLE_PROFILES:
-            tracking_done = (
-                source_states.get("tracking_base", {}).get("status") == "done"
-            )
-            src_chunks = source_video_dir / "tracking_base" / "chunks"
-            if tracking_done and src_chunks.is_dir() and any(src_chunks.iterdir()):
-                dst_chunks = target_video_dir / "tracking_base" / "chunks"
-                if not dst_chunks.exists():
-                    shutil.copytree(
-                        src_chunks,
-                        dst_chunks,
-                        copy_function=_hardlink_or_copy,
-                    )
-
         seeded += 1
 
     return {
@@ -304,18 +278,11 @@ def _new_vrag(
         return VideoRAG(
             **common,
             use_unified_graph=False,
-            use_tm_graph=False,
-            enable_entity_anchoring=False,
         )
     return VideoRAG(
         **common,
         use_unified_graph=True,
-        use_tm_graph=False,
-        enable_entity_anchoring=False,
         asr_model=args.asr_model,
-        entity_tracking_model=args.tracking_model,
-        entity_tracking_fps=args.tracking_fps,
-        spacy_model=args.spacy_model,
         pipeline_continue_on_error=args.continue_on_error,
         pipeline_strict=args.strict_pipeline,
         keep_segment_cache=args.keep_segment_cache,
@@ -686,7 +653,9 @@ def _query_param(scenario: str) -> "QueryParam":
         debate_critique_see_evidence=bool(
             config.get("debate_critique_see_evidence", False)
         ),
-        debate_defender_disable_tools=False,
+        debate_defender_disable_tools=bool(
+            config.get("debate_defender_disable_tools", False)
+        ),
         debate_single_hypothesis=False,
         return_detailed=True,
         wo_reference=True,
@@ -1043,10 +1012,7 @@ def _parse_args():
         "--asr-model",
         default="Systran/faster-distil-whisper-large-v3",
     )
-    parser.add_argument("--tracking-model", default="yolov8n.pt")
-    parser.add_argument("--tracking-fps", type=float, default=3.0)
     parser.add_argument("--caption-model", default="./MiniCPM-V-2_6-int4")
-    parser.add_argument("--spacy-model", default="en_core_web_trf")
     return parser.parse_args()
 
 
@@ -1075,11 +1041,6 @@ def main() -> None:
         raise FileNotFoundError(
             "--strict-pipeline requires --asr-model to be a local directory: "
             f"{args.asr_model}"
-        )
-    if args.strict_pipeline and not Path(args.tracking_model).expanduser().is_file():
-        raise FileNotFoundError(
-            "--strict-pipeline requires --tracking-model to be a local weights file: "
-            f"{args.tracking_model}"
         )
     args.dataset = args.dataset.expanduser().resolve()
     args.video_root = args.video_root.expanduser().resolve()

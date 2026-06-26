@@ -16,13 +16,13 @@ INGESTION_PROFILES: dict[str, dict[str, Any]] = {
         "segmentation_strategy": "fixed",
         "fixed_segment_seconds": 30.0,
     },
-    "no_transcript_memory": {
-        "ablation_profile": "no_transcript_memory",
-        "disable_transcript_memory": True,
+    "no_entity_memory": {
+        "ablation_profile": "no_entity_memory",
+        "entity_memory_max_context": 0,
     },
-    "no_visual_identity_linking": {
-        "ablation_profile": "no_visual_identity_linking",
-        "disable_visual_identity_linking": True,
+    "no_gleaning": {
+        "ablation_profile": "no_gleaning",
+        "extraction_gleaning_rounds": 0,
     },
     "no_crossmodal_alignment": {
         "ablation_profile": "no_crossmodal_alignment",
@@ -44,12 +44,12 @@ QUERY_SCENARIOS: dict[str, dict[str, Any]] = {
         "artifact_profile": "no_adaptive_segmentation",
         "mode": "EBR_RAG",
     },
-    "no_transcript_memory": {
-        "artifact_profile": "no_transcript_memory",
+    "no_entity_memory": {
+        "artifact_profile": "no_entity_memory",
         "mode": "EBR_RAG",
     },
-    "no_visual_identity_linking": {
-        "artifact_profile": "no_visual_identity_linking",
+    "no_gleaning": {
+        "artifact_profile": "no_gleaning",
         "mode": "EBR_RAG",
     },
     "no_crossmodal_alignment": {
@@ -65,6 +65,11 @@ QUERY_SCENARIOS: dict[str, dict[str, Any]] = {
         "artifact_profile": FULL_SCENARIO,
         "mode": "EBR_RAG",
         "debate_critique_see_evidence": True,
+    },
+    "defender_no_tools": {
+        "artifact_profile": FULL_SCENARIO,
+        "mode": "EBR_RAG",
+        "debate_defender_disable_tools": True,
     },
 }
 

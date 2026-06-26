@@ -94,22 +94,7 @@ class VideoRAG:
     segment_retrieval_top_k: int = 8 # Ablation: Tweak baseline to 8 (slightly larger/equal to EBR-RAG max cap)
     video_embedding_dim: int = 1024
 
-    # entity anchoring
-    enable_entity_anchoring: bool = False
-    entity_tracking_model: str = "yolov8n.pt"
-    entity_tracking_tracker: str = "botsort.yaml"
-    entity_tracking_fps: float = 3.0
-    entity_tracking_vid_stride: int = 0
-    entity_tracking_conf: float = 0.25
-    entity_tracking_iou: float = 0.5
-    entity_tracking_imgsz: int = 640
-    entity_linking_similarity_threshold: float = 0.82
-    entity_linking_max_time_gap: float = 3.0
-    entity_memory_top_k: int = 12
-    entity_anchor_storage_dir: str = "entity_anchor"
-    entity_anchor_strict: bool = False
-
-    # unified multimodal graph v2
+    # unified multimodal graph v3
     use_unified_graph: bool = False
     pipeline_resume: bool = True
     asr_model: str = "Systran/faster-distil-whisper-large-v3"
@@ -126,24 +111,10 @@ class VideoRAG:
     segment_context_seconds: float = 1.5
     segmentation_strategy: str = "adaptive"
     fixed_segment_seconds: float = 30.0
-    tracking_chunk_seconds: float = 60.0
-    openclip_model: str = "ViT-B-32"
-    openclip_pretrained: str = "laion2b_s34b_b79k"
-    openclip_batch_size: int = 32
-    visual_merge_threshold: float = 0.85
     frame_min: int = 2
     frame_max: int = 6
     frame_duplicate_threshold: float = 0.94
     frame_marginal_gain_threshold: float = 0.05
-    spacy_model: str = "en_core_web_trf"
-    text_alias_similarity_threshold: float = 0.88
-    text_memory_short_term_mentions: int = 32
-    text_memory_long_term_entities: int = 40
-    text_memory_recent_events: int = 12
-    text_memory_recency_seconds: float = 120.0
-    text_reference_resolution_threshold: float = 0.66
-    text_reference_margin: float = 0.10
-    disable_transcript_memory: bool = False
     caption_model_path: str = "./MiniCPM-V-2_6-int4"
     caption_device: str = "cuda"
     caption_attention: str = "sdpa"
@@ -153,15 +124,12 @@ class VideoRAG:
     caption_visual_slice_nums: int = 1
     caption_visual_batch_size: int = 2
     entity_memory_recent_events: int = 8
-    correspondence_similarity_threshold: float = 0.28
-    correspondence_similarity_margin: float = 0.04
-    correspondence_embedding_batch_size: int = 64
-    correspondence_device: str = "auto"
-    disable_visual_identity_linking: bool = False
     disable_crossmodal_alignment: bool = False
     entity_source: str = "caption"
     crossmodal_batch_size: int = 8
     entity_memory_max_context: int = 25
+    extraction_gleaning_rounds: int = 1
+    caption_alias_similarity_threshold: float = 0.85
     extraction_gleaning_rounds: int = 1
     ablation_profile: str = "full_framework"
     unified_graph_namespace: str = "chunk_entity_relation_v2"
@@ -354,30 +322,10 @@ class VideoRAG:
         return segment_index2name, segment_times_info
 
     def _build_entity_memory_for_video(self, video_name, video_path, segment_times_info, existing_data):
-        if not self.enable_entity_anchoring:
-            return {
-                str(index): data.get("entity_memory", "")
-                for index, data in existing_data.items()
-            } if existing_data else {}
-
-        try:
-            from ._entity_anchor import build_entity_anchor
-
-            result = build_entity_anchor(
-                video_name=video_name,
-                video_path=video_path,
-                segment_times_info=segment_times_info,
-                global_config=asdict(self),
-            )
-            return result.segment_memory
-        except Exception as exc:
-            if self.entity_anchor_strict:
-                raise
-            logger.warning(f"Entity anchoring failed for {video_name}: {exc}. Continuing without entity memory.")
-            return {
-                str(index): data.get("entity_memory", "")
-                for index, data in existing_data.items()
-            } if existing_data else {}
+        return {
+            str(index): data.get("entity_memory", "")
+            for index, data in existing_data.items()
+        } if existing_data else {}
 
     def insert_video(
         self,
@@ -408,8 +356,7 @@ class VideoRAG:
             all_done = False
             if existing_data:
                 all_done = all(v.get("content") is not None and "Caption:\nNone" not in v.get("content") for v in existing_data.values())
-                if self.enable_entity_anchoring:
-                    all_done = all_done and all("entity_memory" in v for v in existing_data.values())
+                all_done = all_done and all("entity_memory" in v for v in existing_data.values())
             
             if all_done:
                 logger.info(f"Find the fully processed video named {os.path.basename(video_path)} in storage and skip it.")
@@ -479,7 +426,7 @@ class VideoRAG:
             error_queue = manager.Queue()
             
             has_captions = existing_data and all(v.get("content") is not None and "Caption:\nNone" not in v.get("content") for v in existing_data.values())
-            if self.enable_entity_anchoring and existing_data:
+            if existing_data:
                 has_captions = has_captions and all("entity_memory" in v for v in existing_data.values())
             
             if not has_captions:
