@@ -19,11 +19,12 @@ Returns a dict: `{answer, rationale, confidence, citations, transcript, evidence
 | `initial_visual_k` | `4` | Visual retrieval initial top-k |
 | `max_evidence` | `16` | Hard cap on evidence pool size throughout debate |
 | `max_rounds` | `2` | Number of Critique → Defender cycles |
-| `max_tool_calls_per_round` | `2` | Max tool calls Defender may make per round |
-| `max_total_tool_calls` | `4` | Hard cap on total Defender tool calls |
+| `max_tool_calls_per_round` | `3` | Max tool calls Defender may make per round |
+| `max_total_tool_calls` | `6` | Hard cap on total Defender tool calls |
 | `graph_context_token_cap` | `1800` | Max tokens for graph context string |
-| `debate_critique_see_evidence` | `False` | A7 ablation: set True to expose evidence to Critique |
-| `debate_defender_disable_tools` | `False` | A6-adjacent: disable Defender tool use |
+| `debate_critique_see_evidence` | `False` | A7 ablation: expose evidence to Critique |
+| `debate_defender_disable_tools` | `False` | A8 ablation: disable Defender tool use |
+| `debate_disable_early_stopping` | `False` | Disable early stopping when Critique finds no significant flaws |
 | `return_detailed` | `False` | Set True to get full metadata dict instead of plain string |
 | `wo_reference` | `True` | Judge prompt mode (without reference answer) |
 
@@ -85,18 +86,21 @@ Default all use `gpt-4o-mini`. Configure in `ROLE_CONFIGS` dict.
 
 ### Critique (Stage 3a, each round)
 - Sees: query + current draft + debate history (last 10 messages)
-- **Default**: does NOT see evidence pool (blinded) — this is the key ablation flag `A7`
-- Uses: `CRITIQUE_PROMPT_OPEN` or `CRITIQUE_PROMPT_MCQ`
-- Produces: list of flaws, gaps, unsupported claims
+- **Default**: does NOT see evidence pool (blinded) — uses independent knowledge to identify gaps
+- When `debate_critique_see_evidence=True` (A7): uses `CRITIQUE_PROMPT_OPEN_WITH_EVIDENCE` which includes evidence pool
+- Produces: numbered list of gaps (OMISSION/OVERREACH/VAGUE) with suggested search queries for Defender
 - Single LLM call, no tools
+- **Early stopping**: if Critique finds no significant flaws, Defender round is skipped
 
 ### Defender (Stage 3b, each round)
 - Sees: query + current draft + critique + full evidence pool
 - Has access to tool calls: `search_text_evidence`, `search_visual_segment`, `search_graph_evidence`
-- Each tool call retrieves 1 item at a time; new items are appended to `state.evidence` if not already present and pool is below `max_evidence`
-- Tool loop runs while `calls_made < max_tool_calls_per_round AND total_calls < max_total_tool_calls AND pool_size < max_evidence`
-- Produces: updated draft with `"Updated Draft"` section extracted as next round's draft
-- `A6 ablation`: `max_rounds=0` skips all Critique/Defender rounds entirely
+- Each tool call retrieves up to 3 items (configurable, cap 5); new items appended to `state.evidence` if not duplicate and pool below `max_evidence`
+- Tool loop: while `calls_made < 3 AND total_calls < 6 AND pool_size < 16`
+- **Safeguard**: "If search finds NO evidence for a critique point, state it is unfounded. Do NOT add unverified claims."
+- Produces: updated draft extracted via regex (3-tier: regex section marker → full output → keep old draft)
+- `A6`: `max_rounds=0` skips all Critique/Defender rounds
+- `A8`: `debate_defender_disable_tools=True` removes tool access
 
 ### Judge (Stage 4)
 - Sees: query + compact transcript (last 50 messages) + full evidence pool (up to 50 items)

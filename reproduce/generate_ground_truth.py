@@ -218,12 +218,34 @@ def truncate_caption(caption: str, max_sentences: int = 3) -> str:
     return ". ".join(sentences[:max_sentences]) + "."
 
 
+def _drop_caption_when_transcript(context: str) -> str:
+    """Drop caption lines for segments that also have a transcript."""
+    lines = context.split("\n")
+    result = []
+    i = 0
+    while i < len(lines):
+        if (
+            lines[i].startswith("Caption: ")
+            and i >= 1
+            and lines[i - 1].startswith("Transcript: ")
+        ):
+            i += 1
+            continue
+        result.append(lines[i])
+        i += 1
+    return "\n".join(result)
+
+
 def fit_context_to_limit(context: str, token_limit: int = 115_000) -> str:
-    """Progressively truncate captions to fit within token limit."""
+    """Progressively compress context to fit within token limit.
+
+    Priority: transcript > caption. Transcript carries narration/speech
+    which is the primary factual source; captions describe visuals.
+    """
     if count_tokens(context) <= token_limit:
         return context
 
-    # Try with 3 sentences per caption, then 2, then 1
+    # Step 1: truncate captions (3 → 2 → 1 sentences)
     for max_sent in [3, 2, 1]:
         lines = context.split("\n")
         trimmed = []
@@ -237,6 +259,14 @@ def fit_context_to_limit(context: str, token_limit: int = 115_000) -> str:
         if count_tokens(result) <= token_limit:
             return result
 
+    # Step 2: drop captions entirely for segments that have transcript
+    result = _drop_caption_when_transcript(result)
+    if count_tokens(result) <= token_limit:
+        return result
+
+    # Step 3: drop ALL remaining captions (caption-only segments)
+    lines = result.split("\n")
+    result = "\n".join(l for l in lines if not l.startswith("Caption: "))
     return result
 
 
@@ -292,9 +322,8 @@ def generate_answers(
     print(f"  Context: ~{ctx_tokens:,} tokens, System: ~{sys_tokens:,} tokens")
     print(f"  Total input per call: ~{ctx_tokens + sys_tokens:,} tokens")
 
-    if ctx_tokens + sys_tokens > 120_000:
-        print(f"  ERROR: Input ~{ctx_tokens + sys_tokens:,} tokens exceeds GPT-4o 128K context limit.")
-        print(f"  Need to reduce data size before proceeding.")
+    if ctx_tokens + sys_tokens > 900_000:
+        print(f"  ERROR: Input ~{ctx_tokens + sys_tokens:,} tokens exceeds 1M context limit.")
         sys.exit(1)
 
     pbar = tqdm(questions, desc=f"  Collection {collection_id}", unit="q")
@@ -334,6 +363,10 @@ def main():
         choices=["0", "6", "11"],
         help="Collection IDs (default: 0)",
     )
+    parser.add_argument(
+        "--model", default="gpt-4.1",
+        help="OpenAI model to use (default: gpt-4.1, 1M context)",
+    )
     args = parser.parse_args()
 
     try:
@@ -365,9 +398,14 @@ def main():
 
         print("  Loading transcript + captions...")
         context = build_context_for_collection(cid)
-        print(f"  Loaded: {len(context):,} chars")
+        print(f"  Loaded: {len(context):,} chars (~{count_tokens(context):,} tokens)")
 
-        generate_answers(cid, questions, context, model="gpt-4o")
+        model_limits = {"gpt-4o": 115_000, "gpt-4o-mini": 115_000}
+        token_limit = model_limits.get(args.model, 900_000)
+        context = fit_context_to_limit(context, token_limit=token_limit)
+        print(f"  After compression: {len(context):,} chars (~{count_tokens(context):,} tokens)")
+
+        generate_answers(cid, questions, context, model=args.model)
 
     print(f"\nDone! Answers at: reproduce/all_answers/*/answers-groundtruth/")
 
