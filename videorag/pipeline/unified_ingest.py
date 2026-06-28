@@ -12,13 +12,6 @@ from typing import Any
 import numpy as np
 from tqdm import tqdm
 
-from .._entity_anchor.appearance import attach_openclip_embeddings
-from .._entity_anchor.text_entities import TextEntityExtractor
-from .._entity_anchor.tracker_v2 import (
-    build_visual_tracklets,
-    link_visual_tracklets,
-    run_chunked_tracking,
-)
 from .._op import get_chunks
 from .._unified_graph.alignment import MiniCPMCaptioner, align_all_segments
 from .._unified_graph.builder import build_unified_graph, validate_unified_graph
@@ -301,16 +294,8 @@ class UnifiedIngestPipeline:
                 lambda context: self._stage_segmentation(context, runner, video_id),
             )
             runner.run_stage(
-                "tracking_base",
-                lambda context: self._stage_tracking(context, runner, video_id),
-            )
-            runner.run_stage(
                 "frame_selection",
                 lambda context: self._stage_frames(context, runner),
-            )
-            runner.run_stage(
-                "text_entities",
-                lambda context: self._stage_text(context, runner),
             )
             runner.run_stage(
                 "alignment_caption",
@@ -465,110 +450,11 @@ class UnifiedIngestPipeline:
             "strategy": strategy,
         }
 
-    def _stage_tracking(
-        self,
-        context,
-        runner: StageRunner,
-        video_id: str,
-    ) -> dict[str, Any]:
-        if self.config.get("entity_source", "caption") == "caption":
-            registry = _new_video_registry(self.vrag.working_dir)
-            context.write_json("observations.json", [])
-            context.write_json("tracklets.json", [])
-            context.write_json("visual_entities.json", [])
-            context.write_json("registry.json", registry.to_dict())
-            context.write_json("appearance_report.json", {
-                "available": False, "reason": "caption_mode",
-            })
-            context.report_metrics(
-                observations=0, tracklets=0, visual_entities=0,
-                appearance_backend="caption_mode",
-                identity_linking=False,
-            )
-            return {
-                "observations": 0, "tracklets": 0, "visual_entities": 0,
-                "appearance": {"available": False, "reason": "caption_mode"},
-            }
-        probe = read_json(runner.output("probe", "probe.json"))
-        segments = read_json(runner.output("segmentation", "segments.json"))
-        with context.progress(
-            total=float(probe["duration"]),
-            unit="s",
-            description="YOLO + BoT-SORT base tracking",
-        ) as progress:
-            observations = run_chunked_tracking(
-                probe["path"],
-                probe,
-                segments,
-                self.config,
-                context.path("chunks"),
-                progress=progress,
-            )
-        tracklets = build_visual_tracklets(observations)
-        if (
-            self.config.get("pipeline_strict", False)
-            and not self.config.get("disable_visual_identity_linking", False)
-            and len(observations) == 0
-        ):
-            raise RuntimeError(
-                "Strict pipeline: tracking_base produced 0 observations for "
-                f"{video_id}. Check YOLO model path, video codec compatibility, "
-                "and that chunk checkpoint files are not stale empty lists."
-            )
-        embedding_report = attach_openclip_embeddings(tracklets, self.config)
-        if (
-            self.config.get("pipeline_strict", False)
-            and tracklets
-            and (
-                not embedding_report.get("available")
-                or int(embedding_report.get("embedded_tracklets", 0))
-                != len(tracklets)
-            )
-        ):
-            raise RuntimeError(
-                "Strict pipeline requires OpenCLIP embeddings for every "
-                "visual tracklet."
-            )
-        registry = _new_video_registry(self.vrag.working_dir)
-        visual_entities = link_visual_tracklets(
-            tracklets,
-            registry,
-            video_id,
-            self.config,
-        )
-        context.write_json("observations.json", observations)
-        context.write_json("tracklets.json", tracklets)
-        context.write_json("visual_entities.json", visual_entities)
-        context.write_json("registry.json", registry.to_dict())
-        context.write_json("appearance_report.json", embedding_report)
-        context.report_metrics(
-            observations=len(observations),
-            tracklets=len(tracklets),
-            visual_entities=len(visual_entities),
-            appearance_backend=(
-                embedding_report.get("model")
-                if embedding_report.get("available")
-                else embedding_report.get("reason")
-            ),
-            identity_linking=not bool(
-                self.config.get("disable_visual_identity_linking", False)
-            ),
-        )
-        return {
-            "observations": len(observations),
-            "tracklets": len(tracklets),
-            "visual_entities": len(visual_entities),
-            "appearance": embedding_report,
-        }
-
     def _stage_frames(self, context, runner: StageRunner) -> dict[str, Any]:
         probe = read_json(runner.output("probe", "probe.json"))
         segments = read_json(runner.output("segmentation", "segments.json"))
         shots = read_json(runner.output("shot_detection", "shots.json"))
-        observations = read_json(
-            runner.output("tracking_base", "observations.json"),
-            [],
-        )
+        observations: list[dict[str, Any]] = []
         selections: dict[str, dict[str, Any]] = {}
         with context.progress(
             total=len(segments),
@@ -610,108 +496,6 @@ class UnifiedIngestPipeline:
             ),
         }
 
-    def _stage_text(self, context, runner: StageRunner) -> dict[str, Any]:
-        if self.config.get("entity_source", "caption") == "caption":
-            context.write_json("text_entities.json", {})
-            context.write_json("text_memory.json", {})
-            context.report_metrics(
-                backend="skipped_caption_mode",
-                mentions=0,
-                resolved_references=0,
-                unresolved_references=0,
-            )
-            return {
-                "output": str(context.path("text_entities.json")),
-                "backend": "skipped_caption_mode",
-                "resolved_references": 0,
-                "unresolved_references": 0,
-            }
-        segments = read_json(runner.output("segmentation", "segments.json"))
-        asr = read_json(runner.output("asr", "asr.json"))
-        by_segment = assign_words_to_segments(
-            asr["words"],
-            segments,
-        )
-        checkpoint = context.load_checkpoint(default={}) or {}
-        next_index = int(checkpoint.get("next_index", 0))
-        extractor = TextEntityExtractor(
-            self.config,
-            state=checkpoint.get("extractor"),
-        )
-        results = {}
-        for previous_index in range(next_index):
-            segment_id = segments[previous_index]["segment_id"]
-            previous = read_json(
-                context.path(f"segments/{segment_id}.json")
-            )
-            if previous:
-                results[segment_id] = previous
-        with context.progress(
-            total=len(segments),
-            unit="seg",
-            description="Transcript entity extraction",
-            completed=next_index,
-        ) as progress:
-            for index, segment in enumerate(
-                segments[next_index:],
-                start=next_index,
-            ):
-                segment_id = segment["segment_id"]
-                result = extractor.extract_segment(
-                    segment,
-                    by_segment.get(segment_id, []),
-                )
-                results[segment_id] = result
-                atomic_write_json(
-                    context.path(f"segments/{segment_id}.json"),
-                    result,
-                )
-                context.save_checkpoint(
-                    {
-                        "next_index": index + 1,
-                        "extractor": extractor.to_state(),
-                    }
-                )
-                progress.set(
-                    index + 1,
-                    entities=sum(
-                        len(item["mentions"]) for item in results.values()
-                    ),
-                    resolved_references=sum(
-                        1
-                        for item in results.values()
-                        for reference in item.get("references", [])
-                        if reference.get("status") == "resolved"
-                    ),
-                )
-        context.write_json("text_entities.json", results)
-        context.write_json("text_memory.json", extractor.memory.to_state())
-        resolved_references = sum(
-            1
-            for item in results.values()
-            for reference in item.get("references", [])
-            if reference.get("status") == "resolved"
-        )
-        unresolved_references = sum(
-            1
-            for item in results.values()
-            for reference in item.get("references", [])
-            if reference.get("status") == "unresolved"
-        )
-        context.report_metrics(
-            backend=extractor.backend,
-            mentions=sum(len(item["mentions"]) for item in results.values()),
-            resolved_references=resolved_references,
-            unresolved_references=unresolved_references,
-        )
-        return {
-            "output": str(context.path("text_entities.json")),
-            "memory": str(context.path("text_memory.json")),
-            "backend": extractor.backend,
-            "resolved_references": resolved_references,
-            "unresolved_references": unresolved_references,
-        }
-
     def _stage_alignment(
         self,
         context,
@@ -721,9 +505,6 @@ class UnifiedIngestPipeline:
         segments = read_json(runner.output("segmentation", "segments.json"))
         selections = read_json(
             runner.output("frame_selection", "frame_selections.json")
-        )
-        text_results = read_json(
-            runner.output("text_entities", "text_entities.json")
         )
         asr = read_json(runner.output("asr", "asr.json"))
         by_segment = assign_words_to_segments(asr["words"], segments)
@@ -738,12 +519,7 @@ class UnifiedIngestPipeline:
             for seg in segments
         }
 
-        observations = read_json(
-            runner.output("tracking_base", "observations.json"), [],
-        )
-        registry = EntityRegistry(
-            read_json(runner.output("tracking_base", "registry.json"), {})
-        )
+        registry = _new_video_registry(self.vrag.working_dir)
         global_registry = _load_global_registry(self.vrag.working_dir)
         registry.name_to_global.update(global_registry.name_to_global)
         global_memory_path = (
@@ -771,8 +547,8 @@ class UnifiedIngestPipeline:
                 video_id,
                 segments,
                 selections,
-                text_results,
-                observations,
+                {},
+                [],
                 registry,
                 self.config,
                 context.path("segments"),

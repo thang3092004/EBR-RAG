@@ -442,44 +442,26 @@ class VideoRAG:
                         self.video_output_format,
                     )
                 )
-                
-                process_segment_caption = multiprocessing.Process(
-                    target=segment_caption,
-                    args=(
-                        video_name,
-                        video_path,
-                        segment_index2name,
-                        transcripts,
-                        segment_times_info,
-                        captions,
-                        error_queue,
-                        segment_entity_memory,
-                        self.working_dir,
-                    )
-                )
-                
                 process_saving_video_segments.start()
-                process_segment_caption.start()
-                
-                # Monitor processes
-                import time
-                while process_saving_video_segments.is_alive() and process_segment_caption.is_alive():
-                    time.sleep(1)
-                
-                # if one died, check for error and terminate other
-                if not process_segment_caption.is_alive() and process_segment_caption.exitcode != 0:
-                    process_saving_video_segments.terminate()
-                if not process_saving_video_segments.is_alive() and process_saving_video_segments.exitcode != 0:
-                    process_segment_caption.terminate()
+
+                segment_caption(
+                    video_name,
+                    video_path,
+                    segment_index2name,
+                    transcripts,
+                    segment_times_info,
+                    captions,
+                    error_queue,
+                    segment_entity_memory,
+                    self.working_dir,
+                )
 
                 process_saving_video_segments.join()
-                process_segment_caption.join()
-                
-                # if raise error in this two, stop the processing
+
                 error_messages = []
                 while not error_queue.empty():
                     error_messages.append(error_queue.get())
-                
+
                 if error_messages:
                     for error_message in error_messages:
                         with open('error_log_videorag.txt', 'a', encoding='utf-8') as log_file:

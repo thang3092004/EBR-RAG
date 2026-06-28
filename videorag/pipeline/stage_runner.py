@@ -23,6 +23,8 @@ REMOVED_STAGE_NAMES = {
     "modality_profile",
     "deep_processing",
     "speaker_linking",
+    "tracking_base",
+    "text_entities",
 }
 
 
@@ -420,8 +422,6 @@ class StageRunner:
                 key: self.config.get(key)
                 for key in (
                     "asr_model",
-                    "entity_tracking_model",
-                    "entity_tracking_fps",
                     "caption_backend",
                     "segment_target_seconds",
                     "frame_min",

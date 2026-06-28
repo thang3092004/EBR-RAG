@@ -1,7 +1,6 @@
 import asyncio
 import os
 from pathlib import Path
-import torch
 from dataclasses import dataclass
 from typing import Optional
 import numpy as np
@@ -109,8 +108,10 @@ class NanoVectorDBVideoSegmentStorage(BaseVectorStorage):
                     "Strict pipeline found a truncated ImageBind checkpoint: "
                     f"{checkpoint}"
                 )
+            import torch
             if not torch.cuda.is_available():
                 raise RuntimeError("Strict pipeline requires CUDA for ImageBind.")
+        import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
         _prev_cwd = os.getcwd()
         try:
@@ -144,12 +145,14 @@ class NanoVectorDBVideoSegmentStorage(BaseVectorStorage):
         for _batch in tqdm(batches, desc=f"Encoding Video Segments {video_name}"):
             batch_embeddings = encode_video_segments(_batch, embedder)
             embeddings.append(batch_embeddings)
+        import torch
         embeddings = torch.concat(embeddings, dim=0)
         embeddings = embeddings.numpy()
         for i, d in enumerate(list_data):
             d["__vector__"] = embeddings[i]
         results = self._client.upsert(datas=list_data)
         del embedder
+        import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return results
@@ -159,6 +162,7 @@ class NanoVectorDBVideoSegmentStorage(BaseVectorStorage):
 
         from .._videoutil.feature import encode_string_query
 
+        import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
         embedder = imagebind_model.imagebind_huge(pretrained=True).to(device)
         embedder.eval()
@@ -175,6 +179,7 @@ class NanoVectorDBVideoSegmentStorage(BaseVectorStorage):
             for dp in results
         ]
         del embedder
+        import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return results

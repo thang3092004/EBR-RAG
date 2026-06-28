@@ -972,7 +972,6 @@ def align_all_segments(
     loop=None,
     transcripts: dict[str, str] | None = None,
     initial_entity_memory: dict[str, Any] | None = None,
-    correspondence_encoder=None,
 ) -> dict[str, Any]:
     checkpoint_path = Path(checkpoint_dir)
     checkpoint_path.mkdir(parents=True, exist_ok=True)

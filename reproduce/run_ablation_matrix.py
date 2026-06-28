@@ -80,9 +80,9 @@ REUSABLE_FULL_STAGES = {
     ),
 }
 
-# Profiles whose visual captioning (Pass 1) output is identical to A1's.
-# visual_pass.json is seeded from full_framework workdir so Pass 1 is skipped.
-VISUAL_PASS_REUSABLE_PROFILES = {"no_entity_memory", "no_gleaning"}
+# Profiles whose MiniCPM captions are identical to A1's.
+# captions.json is seeded from full_framework workdir so captioning is skipped.
+CAPTION_REUSABLE_PROFILES = {"no_entity_memory", "no_gleaning", "no_crossmodal_alignment"}
 
 
 def _utc_now() -> str:
@@ -229,26 +229,24 @@ def _seed_profile_from_full(
                 "stages": seeded_states,
             },
         )
-        # Seed visual_pass.json from A1 for profiles that reuse visual captioning.
-        # visual_pass.json lives inside alignment_caption/segments/ and is purely
-        # frame-based (no transcript memory, no crossmodal config), so it is
-        # identical across ablation profiles that share the same segmentation and
-        # tracking. Seeding it lets Pass 1 be skipped entirely in align_all_segments().
-        if profile in VISUAL_PASS_REUSABLE_PROFILES:
-            src_vpass = (
+        # Seed captions.json from A1 for profiles that reuse MiniCPM captions.
+        # Captions are purely frame-based (no entity memory or gleaning config),
+        # so they are identical across profiles that share the same segmentation.
+        if profile in CAPTION_REUSABLE_PROFILES:
+            src_captions = (
                 source_video_dir
                 / "alignment_caption"
                 / "segments"
-                / "visual_pass.json"
+                / "captions.json"
             )
-            if src_vpass.exists():
+            if src_captions.exists():
                 dst_seg_dir = (
                     target_video_dir / "alignment_caption" / "segments"
                 )
                 dst_seg_dir.mkdir(parents=True, exist_ok=True)
-                dst_vpass = dst_seg_dir / "visual_pass.json"
-                if not dst_vpass.exists():
-                    _hardlink_or_copy(str(src_vpass), str(dst_vpass))
+                dst_captions = dst_seg_dir / "captions.json"
+                if not dst_captions.exists():
+                    _hardlink_or_copy(str(src_captions), str(dst_captions))
 
         seeded += 1
 
@@ -335,17 +333,9 @@ def _collect_artifact_report(
         "segments": 0,
         "segment_boundaries": 0,
         "boundaries_inside_words": 0,
-        "tracklets": 0,
-        "visual_entities": 0,
-        "text_mentions": 0,
-        "resolved_references": 0,
-        "unresolved_references": 0,
         "alignment_edges": 0,
-        "raw_merge_candidates": 0,
-        "gated_merge_candidates": 0,
-        "accepted_merges": 0,
+        "alignment_entities": 0,
     }
-    correspondence: dict[str, int] = {}
     segment_durations = []
     edge_modalities: dict[str, int] = {}
     completed_videos = 0
@@ -387,41 +377,18 @@ def _collect_artifact_report(
                 for word in asr.get("words", [])
             ):
                 stage_totals["boundaries_inside_words"] += 1
-        tracking = stages.get("tracking_base", {}).get("metrics", {})
-        stage_totals["tracklets"] += int(tracking.get("tracklets", 0))
-        stage_totals["visual_entities"] += int(
-            tracking.get("visual_entities", 0)
-        )
-        text = stages.get("text_entities", {}).get("metrics", {})
-        stage_totals["text_mentions"] += int(text.get("mentions", 0))
-        stage_totals["resolved_references"] += int(
-            text.get("resolved_references", 0)
-        )
-        stage_totals["unresolved_references"] += int(
-            text.get("unresolved_references", 0)
-        )
         alignment = stages.get("alignment_caption", {}).get("metrics", {})
         stage_totals["alignment_edges"] += int(alignment.get("edges", 0))
-        _sum_nested_counts(
-            correspondence,
-            alignment.get("correspondence", {}),
-        )
         alignment_path = (
             manifest_path.parent
             / "alignment_caption"
             / "alignment.json"
         )
         payload = read_json(alignment_path, {})
+        stage_totals["alignment_entities"] += len(
+            payload.get("registry", {}).get("entities", [])
+        )
         for segment in payload.get("segments", {}).values():
-            stage_totals["raw_merge_candidates"] += len(
-                segment.get("raw_candidate_merges", [])
-            )
-            stage_totals["gated_merge_candidates"] += len(
-                segment.get("candidate_merges", [])
-            )
-            stage_totals["accepted_merges"] += len(
-                segment.get("accepted_merges", [])
-            )
             for edge in segment.get("edges", []):
                 modalities = "+".join(
                     sorted(edge.get("modalities", []))
@@ -429,14 +396,6 @@ def _collect_artifact_report(
                 edge_modalities[modalities] = (
                     edge_modalities.get(modalities, 0) + 1
                 )
-    tracklets = stage_totals["tracklets"]
-    visual_entities = stage_totals["visual_entities"]
-    references = (
-        stage_totals["resolved_references"]
-        + stage_totals["unresolved_references"]
-    )
-    raw_candidates = stage_totals["raw_merge_candidates"]
-    gated_candidates = stage_totals["gated_merge_candidates"]
     report.update(
         {
             "videos_completed": completed_videos,
@@ -459,22 +418,7 @@ def _collect_artifact_report(
                     stage_totals["boundaries_inside_words"]
                     / max(stage_totals["segment_boundaries"], 1)
                 ),
-                "tracklets_per_visual_entity": (
-                    tracklets / max(visual_entities, 1)
-                ),
-                "reference_resolution_rate": (
-                    stage_totals["resolved_references"]
-                    / max(references, 1)
-                ),
-                "gate_pass_rate": (
-                    gated_candidates / max(raw_candidates, 1)
-                ),
-                "merge_acceptance_rate": (
-                    stage_totals["accepted_merges"]
-                    / max(gated_candidates, 1)
-                ),
             },
-            "correspondence": correspondence,
             "edge_modalities": edge_modalities,
         }
     )
