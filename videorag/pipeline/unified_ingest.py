@@ -697,6 +697,22 @@ class UnifiedIngestPipeline:
         probe = read_json(runner.output("probe", "probe.json"))
         segments = read_json(runner.output("segmentation", "segments.json"))
         segment_payload = self._segment_storage_payload(runner, video_id)
+
+        # Visual feature reuse: ImageBind embeddings depend only on the video
+        # clips (segmentation). Profiles that seed segmentation from full_framework
+        # have identical clips, so identical features. If all segment features for
+        # this video are already present in the VDB (seeded), skip the expensive
+        # clip extraction + ImageBind embedding.
+        reuse_visual = False
+        _vsf_client = getattr(self.vrag.video_segment_feature_vdb, "_client", None)
+        if _vsf_client is not None and segments:
+            wanted_ids = [f"{video_id}_{seg['index']}" for seg in segments]
+            try:
+                present = {item["__id__"] for item in _vsf_client.get(wanted_ids)}
+                reuse_visual = all(wid in present for wid in wanted_ids)
+            except Exception:
+                reuse_visual = False
+
         old_video_data = getattr(self.vrag.video_segments, "_data", {}).get(
             video_id,
             {},
@@ -705,7 +721,7 @@ class UnifiedIngestPipeline:
             f"{video_id}_{segment_index}"
             for segment_index in old_video_data
         ]
-        if old_visual_ids and hasattr(
+        if not reuse_visual and old_visual_ids and hasattr(
             getattr(self.vrag.video_segment_feature_vdb, "_client", None),
             "delete",
         ):
@@ -745,7 +761,7 @@ class UnifiedIngestPipeline:
                 )
                 segment_index2name[str(segment["index"])] = name
                 clip_path = cache_dir / f"{name}.{self.vrag.video_output_format}"
-                if (
+                if not reuse_visual and (
                     self.config.get("pipeline_strict", False)
                     or not clip_path.exists()
                 ):
@@ -801,13 +817,14 @@ class UnifiedIngestPipeline:
         if self.vrag.entities_vdb is not None and entity_data:
             self._await(self.vrag.entities_vdb.upsert(entity_data))
 
-        self._await(
-            self.vrag.video_segment_feature_vdb.upsert(
-                video_id,
-                segment_index2name,
-                self.vrag.video_output_format,
+        if not reuse_visual:
+            self._await(
+                self.vrag.video_segment_feature_vdb.upsert(
+                    video_id,
+                    segment_index2name,
+                    self.vrag.video_output_format,
+                )
             )
-        )
         self._await(self.vrag._insert_done())
         context.report_metrics(
             chunks=len(chunks),

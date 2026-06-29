@@ -47,6 +47,10 @@ judge_output.json
 !GRAPH_ABLATION_PLAN.md
 !MINIMAL_ABLATION_0_6_11.md
 !CLAUDE.md
+!PIPELINE_V3_ARCHITECTURE.md
+!FIX_AGENT_PROMPT.md
+!PIPELINE_REDESIGN_SPEC.md
+!STAGE8_FIX_PROMPT.md
 !.claude/
 !.claude/**
 /.pytest_tmp*/
@@ -81,6 +85,10 @@ run_ingest.py
 *.zip
 *.tar.gz
 *.7z
+
+# --- Temp media files (MoviePy) ---
+*TEMP_MPY_*.mp3
+*TEMP_MPY_*.mp4
 
 # --- OS ---
 .DS_Store

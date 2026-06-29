@@ -250,6 +250,17 @@ def _seed_profile_from_full(
 
         seeded += 1
 
+    # Seed visual segment feature VDB from full_framework for profiles that
+    # share segmentation. ImageBind clip embeddings are identical when the
+    # clips (segment boundaries) are identical, so _stage_index can skip the
+    # expensive clip extraction + ImageBind embedding entirely.
+    if profile in CAPTION_REUSABLE_PROFILES:
+        src_vdb = full_workdir / "vdb_video_segment_feature_v2.json"
+        dst_vdb = target_workdir / "vdb_video_segment_feature_v2.json"
+        if src_vdb.exists() and not dst_vdb.exists():
+            target_workdir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src_vdb), str(dst_vdb))
+
     return {
         "status": "complete",
         "seeded_videos": seeded,

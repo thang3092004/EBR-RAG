@@ -37,6 +37,7 @@ Rules:
 - Do NOT start with "The video segment shows/captures/depicts".
 - Use specific names if visible in text overlays or recognizable (e.g. species names).
 - For each distinct person or animal: note appearance and position in frame.
+- If text overlays, titles, or on-screen graphics are visible, transcribe them exactly.
 - Maximum 100 words.
 """
 
@@ -60,8 +61,13 @@ Entities accumulated from previous batches. Reuse their EXACT names when encount
 ---Entity Types---
 - Person: Named or role-identified humans (e.g. DAVID ATTENBOROUGH, NARRATOR, RESEARCHER)
 - Animal: Living creatures (e.g. LION, SCARFACE, DOLPHIN). Use SINGULAR form.
+- Organization: Companies, institutions, groups (e.g. BBC, EMMY AWARDS, UNIVERSITY)
 - Object: Physical objects relevant to narrative (e.g. NEST, FISH, ROCK)
-- Location: Geographic places, habitats (e.g. SAVANNA, CORAL REEF, RIVER)
+- Geo: Named geographic entities (e.g. NEVADA, AFRICA, ATLANTIC OCEAN)
+- Location: Described places, habitats (e.g. SAVANNA, CORAL REEF, CLASSROOM)
+- Event: Occurrences, ceremonies, incidents (e.g. HUNT, CEREMONY, MIGRATION)
+- Concept: Scientific terms, theories, abstract ideas (e.g. FOURIER TRANSFORM, WAVELET, SIGNAL PROCESSING)
+- Screen_element: On-screen text, titles, graphics (e.g. TITLE CARD, SUBTITLE, CREDITS)
 
 ---Segments---
 {segments_data}
@@ -74,7 +80,7 @@ For each meaningful entity found in visual captions OR transcripts:
 - "entity_name": Canonical name, CAPITALIZED, SINGULAR. Use specific names from transcript \
 when available (SCARFACE not MONKEY). For unnamed people use roles (NARRATOR, DIVER). \
 If entity matches one in Known Entities, use the EXACT same name.
-- "entity_type": One of [person, animal, object, location]
+- "entity_type": One of [person, animal, organization, object, geo, location, event, concept, screen_element]
 - "entity_description": Concise description of appearance, role, distinguishing features. \
 Third person. No pronouns.
 - "source_segments": List of segment IDs where this entity appears
@@ -570,7 +576,7 @@ def _validate_graphrag_result(raw: dict[str, Any]) -> dict[str, Any]:
         if not name or len(name) < 2 or name in ENTITY_NOISE:
             continue
         etype = str(ent.get("entity_type", "object")).strip().lower()
-        if etype not in {"person", "animal", "object", "location", "event", "concept"}:
+        if etype not in {"person", "animal", "organization", "object", "geo", "location", "event", "concept", "screen_element"}:
             etype = "object"
         if name == "HARE" and etype == "object":
             etype = "animal"
