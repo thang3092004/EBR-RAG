@@ -7,7 +7,14 @@ Metrics:
   3. Answer Correctness — factual F1 + semantic similarity vs ground truth
 
 Usage:
-    pip install ragas datasets
+    # IMPORTANT: ragas 0.1.x pins openai<2 and langchain 0.2.x, which would
+    # DOWNGRADE the pipeline venv (openai 2.x). This script is self-contained
+    # (reads result/groundtruth files only — no videorag import), so install it
+    # in an ISOLATED venv to keep the main pipeline venv intact:
+    #
+    #   python -m venv .venv-ragas
+    #   .venv-ragas/bin/pip install "ragas>=0.1,<0.2" datasets python-dotenv openai
+    #   .venv-ragas/bin/python reproduce/ragas_eval.py --collections 0 6 11
 
     # Collection 0 only
     python reproduce/ragas_eval.py --collections 0
@@ -125,7 +132,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--results-root", type=Path,
-        default=ROOT / "reproduce" / "full-framework-results",
+        # Must match run_ablation_matrix.py query --output-root default
+        # (reproduce/minimal_ablation_answers), where result_<id>.json files land.
+        default=ROOT / "reproduce" / "minimal_ablation_answers",
     )
     parser.add_argument(
         "--groundtruth-root", type=Path,
