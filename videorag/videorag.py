@@ -122,7 +122,7 @@ class VideoRAG:
     caption_max_slice_nums: int = 2
     caption_visual_max_tokens: int = 200
     caption_visual_slice_nums: int = 1
-    caption_visual_batch_size: int = 2
+    caption_visual_batch_size: int = 6
     entity_memory_recent_events: int = 8
     disable_crossmodal_alignment: bool = False
     entity_source: str = "caption"

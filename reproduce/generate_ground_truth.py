@@ -34,7 +34,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 DATASET_PATH = ROOT / "longervideos" / "dataset.json"
-WORKDIR_BASE = ROOT / "longervideos" / "videorag-workdir"
+WORKDIR_BASE = ROOT / "longervideos" / "ablation-workdirs"
 OUTPUT_BASE = ROOT / "reproduce" / "all_answers"
 
 COLLECTION_FOLDERS = {
@@ -367,7 +367,15 @@ def main():
         "--model", default="gpt-4.1",
         help="OpenAI model to use (default: gpt-4.1, 1M context)",
     )
+    parser.add_argument(
+        "--workdir-base", type=Path, default=None,
+        help="Override ingested-data root (default: longervideos/ablation-workdirs)",
+    )
     args = parser.parse_args()
+
+    if args.workdir_base is not None:
+        global WORKDIR_BASE
+        WORKDIR_BASE = args.workdir_base.expanduser().resolve()
 
     try:
         from dotenv import load_dotenv

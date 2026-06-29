@@ -261,6 +261,23 @@ def _seed_profile_from_full(
             target_workdir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src_vdb), str(dst_vdb))
 
+    # no_adaptive_segmentation uses fixed 30s segments identical to the VideoRAG
+    # baseline. Baseline's ImageBind clip features are >0.99 cosine-identical to
+    # what V3 recomputes (verified on collection 0: 360/360 ids, mean sim 0.998),
+    # so reuse them from baseline and let _stage_index skip ImageBind. reuse_visual
+    # is checked per-video, so any video whose segment ids don't fully match the
+    # seeded set is recomputed cleanly rather than reusing wrong features.
+    if profile == "no_adaptive_segmentation":
+        baseline_vdb = (
+            target_workdir.parent
+            / BASELINE_SCENARIO
+            / "vdb_video_segment_feature.json"
+        )
+        dst_vdb = target_workdir / "vdb_video_segment_feature_v2.json"
+        if baseline_vdb.exists() and not dst_vdb.exists():
+            target_workdir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(baseline_vdb), str(dst_vdb))
+
     return {
         "status": "complete",
         "seeded_videos": seeded,

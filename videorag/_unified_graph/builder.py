@@ -56,14 +56,23 @@ async def build_unified_graph(
         )
 
     edge_count = 0
+    dropped_edges = 0
     for segment_id, segment in alignment_segments.items():
         for edge in segment.get("edges", []):
             source = str(edge["source_id"])
             target = str(edge["target_id"])
             if source not in registry.entities or target not in registry.entities:
-                raise ValueError(
-                    f"Edge {edge.get('edge_id')} references missing node: {source} -> {target}"
+                # Drop edges whose endpoints never registered as nodes. This is
+                # invalid data (an entity referenced in a relationship but filtered
+                # as noise / not carried forward when memory or gleaning is off),
+                # not a recoverable case — log it transparently and count it rather
+                # than aborting the whole graph build over a handful of bad edges.
+                logger.warning(
+                    "Dropping dangling edge %s: missing node %s -> %s",
+                    edge.get("edge_id"), source, target,
                 )
+                dropped_edges += 1
+                continue
             await storage.upsert_edge(
                 source,
                 target,
@@ -74,9 +83,15 @@ async def build_unified_graph(
                 },
             )
             edge_count += 1
+    if dropped_edges:
+        logger.warning(
+            "build_unified_graph: dropped %d dangling edge(s) referencing missing nodes",
+            dropped_edges,
+        )
     return {
         "nodes": len(registry.entities),
         "edges": edge_count,
+        "dropped_edges": dropped_edges,
     }
 
 

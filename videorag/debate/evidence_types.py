@@ -24,6 +24,10 @@ class EvidenceItem:
             "type": self.type,
             "score": self.score,
             "snippet": self.snippet[:300] if self.snippet else "",
+            # Full (uncapped) text the debate agents actually saw, so offline
+            # RAGAS faithfulness/context metrics are judged against the SAME
+            # context the answer was generated from (not the 300-char preview).
+            "snippet_full": self.snippet if self.snippet else "",
             "source": self.source,
             "video_name": self.video_name,
             "segment_index": self.segment_index,

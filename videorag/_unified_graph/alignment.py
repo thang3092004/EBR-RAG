@@ -254,16 +254,22 @@ class MiniCPMCaptioner:
         except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
             if "out of memory" not in str(exc).lower():
                 raise
+            # No silent per-segment fallback: free VRAM and fail loudly so the
+            # batch is fixed (lower caption_visual_batch_size) rather than the
+            # run silently degrading to slow per-segment captioning.
+            import gc
+            try:
+                del responses
+            except NameError:
+                pass
+            gc.collect()
             torch.cuda.empty_cache()
-            return [
-                self._chat_text(
-                    prompts[i],
-                    images_list[i],
-                    max_tokens=max_tokens,
-                    max_slice_nums=max_slice_nums,
-                )
-                for i in range(len(prompts))
-            ]
+            torch.cuda.synchronize()
+            raise RuntimeError(
+                f"MiniCPM batch OOM at caption_visual_batch_size={len(prompts)}. "
+                "VRAM freed; lower caption_visual_batch_size and resume "
+                "(captions.json checkpoints completed segments)."
+            ) from exc
         return [str(r).strip() for r in responses]
 
     def caption(
