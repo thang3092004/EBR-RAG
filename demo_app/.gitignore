@@ -1,0 +1,6 @@
+# Demo runtime artifacts — never commit these
+workdir/
+videos/
+__pycache__/
+*.pyc
+.env

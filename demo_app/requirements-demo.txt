@@ -1,0 +1,6 @@
+# Extra deps for the interactive demo (on top of the repo-root requirements.txt)
+streamlit>=1.36
+pyvis>=0.3.2
+yt-dlp>=2024.0.0
+pandas
+networkx>=3.0
